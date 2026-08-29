@@ -11,9 +11,11 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Path returns the machine-global database path for the current Windows user:
-// %LOCALAPPDATA%\Workgate\workgate.db (resolved via os.UserCacheDir, which
-// uses the platform's Local AppData mechanism rather than a literal path).
+// Path returns the machine-global database path for the current OS user,
+// <user cache dir>/Workgate/workgate.db, resolved via os.UserCacheDir:
+// %LOCALAPPDATA%\Workgate\workgate.db on Windows,
+// ~/Library/Caches/Workgate/workgate.db on macOS, and
+// $XDG_CACHE_HOME/Workgate/workgate.db (default ~/.cache/...) on Linux.
 //
 // The WORKGATE_DB environment variable overrides the path. This exists for
 // tests (including multi-process integration tests) and is not intended as
@@ -24,7 +26,7 @@ func Path() (string, error) {
 	}
 	base, err := os.UserCacheDir()
 	if err != nil {
-		return "", fmt.Errorf("resolving Local AppData directory: %w", err)
+		return "", fmt.Errorf("resolving user cache directory: %w", err)
 	}
 	return filepath.Join(base, "Workgate", "workgate.db"), nil
 }

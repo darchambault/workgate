@@ -6,32 +6,25 @@ on:
   pull_request:
 
 jobs:
-  test-windows:
-    runs-on: windows-latest
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
       - name: Check formatting
+        shell: bash
         run: |
-          $files = gofmt -l .
-          if ($files) { Write-Output "gofmt needed:"; Write-Output $files; exit 1 }
+          files=$(gofmt -l .)
+          if [ -n "$files" ]; then echo "gofmt needed:"; echo "$files"; exit 1; fi
       - name: Vet
         run: go vet ./...
       - name: Build
-        run: go build -o workgate.exe ./cmd/workgate
+        run: go build ./...
       - name: Test (includes multi-process e2e)
         run: go test ./... -count=1 -timeout 10m
-
-  # The tool targets Windows, but the non-Windows stub (job_other.go) should
-  # keep compiling so a cross-platform port stays cheap.
-  build-linux:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-      - name: Build
-        run: go build ./...

@@ -21,7 +21,7 @@ if ($go) {
 } elseif (Test-Path "C:\Program Files\Go\bin\go.exe") {
     $go = "C:\Program Files\Go\bin\go.exe"
 } else {
-    throw "Go toolchain not found. Install Go 1.24+ (e.g. 'winget install GoLang.Go')."
+    throw "Go toolchain not found. Install Go 1.25+ (e.g. 'winget install GoLang.Go')."
 }
 
 if (-not $SkipTests) {

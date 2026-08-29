@@ -136,9 +136,10 @@ func cmdRun(args []string) int {
 	}
 	defer release()
 
-	// Interrupt (Ctrl+C or termination request) cancels this context; the
-	// child shares the console so it receives Ctrl+C as well.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	// Interrupt (Ctrl+C or a termination signal) cancels this context; the
+	// runner then forwards the interrupt to the child where the platform
+	// does not deliver it directly.
+	ctx, stop := signal.NotifyContext(context.Background(), shutdownSignals()...)
 	defer stop()
 
 	onStale := func(r queue.StaleRemoved) {

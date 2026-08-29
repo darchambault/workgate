@@ -18,14 +18,14 @@ func TestPathEnvOverride(t *testing.T) {
 	}
 }
 
-func TestPathDefaultsToLocalAppData(t *testing.T) {
+func TestPathDefaultsToUserCacheDir(t *testing.T) {
 	t.Setenv("WORKGATE_DB", "")
 	got, err := Path()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasSuffix(got, filepath.Join("Workgate", "workgate.db")) {
-		t.Fatalf("Path() = %q, want ...\\Workgate\\workgate.db", got)
+	if want := filepath.Join("Workgate", "workgate.db"); !strings.HasSuffix(got, want) {
+		t.Fatalf("Path() = %q, want suffix %q", got, want)
 	}
 }
 

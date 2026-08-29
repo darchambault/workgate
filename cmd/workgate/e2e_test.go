@@ -8,6 +8,7 @@ package main
 import (
 	"bytes"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -97,6 +98,10 @@ func startWG(t *testing.T, dir string, env []string, args ...string) *wgProc {
 	p.cmd.Env = append(os.Environ(), env...)
 	p.cmd.Stdout = syncWriter{p}
 	p.cmd.Stderr = syncWriter{p}
+	// Hard-kill tests leave workgate's helper child alive holding the
+	// stdio pipes; on Unix (without Linux's pdeathsig) Wait would then
+	// block until the orphan exits on its own. WaitDelay bounds that.
+	p.cmd.WaitDelay = 10 * time.Second
 	if err := p.cmd.Start(); err != nil {
 		t.Fatalf("starting workgate: %v", err)
 	}
@@ -115,7 +120,9 @@ func (p *wgProc) waitExit(t *testing.T, timeout time.Duration) int {
 	t.Helper()
 	select {
 	case err := <-p.done:
-		if err == nil {
+		if err == nil || errors.Is(err, exec.ErrWaitDelay) {
+			// ErrWaitDelay only replaces a nil Wait error: the process
+			// exited cleanly but an orphaned child still holds its pipes.
 			return 0
 		}
 		var ee *exec.ExitError

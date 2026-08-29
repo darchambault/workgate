@@ -1,6 +1,6 @@
 // Package runner launches the wrapped child command, ties its lifetime to
-// the workgate process (via a Windows Job Object), and maps outcomes to
-// exit codes.
+// the workgate process (via a Windows Job Object, or a dedicated process
+// group on macOS/Linux), and maps outcomes to exit codes.
 package runner
 
 import (
@@ -22,18 +22,20 @@ const (
 )
 
 // interruptGrace is how long an interrupted runner waits for the child to
-// exit on its own (it shares the console, so Ctrl+C reaches it too) before
-// forcibly terminating the job.
+// exit on its own — after nudging it via the guard's interrupt() — before
+// forcibly terminating the child's process tree.
 const interruptGrace = 5 * time.Second
 
 // Run executes argv as a direct child process (no shell interpretation),
-// forwarding stdio. The child is placed in a kill-on-close Job Object so
-// that if the workgate process dies for any reason — including a hard kill
-// where no cleanup code runs — the OS terminates the child's process tree
-// rather than leaving orphans.
+// forwarding stdio. The child's process tree is tied to workgate through a
+// platform childGuard: on Windows a kill-on-close Job Object (the OS
+// terminates the tree even if workgate is hard-killed); on macOS/Linux a
+// dedicated process group that workgate signals on its own termination
+// paths (Linux additionally arms PR_SET_PDEATHSIG for the direct child).
 //
-// If ctx is canceled while the child runs, Run waits briefly for the child
-// to exit, then terminates the job, and returns ExitInterrupted.
+// If ctx is canceled while the child runs, Run forwards an interrupt to
+// the child, waits briefly for it to exit, then terminates its process
+// tree, and returns ExitInterrupted.
 //
 // The returned error is nil whenever the returned code is the child's own
 // exit status; warn (may be nil) receives non-fatal diagnostics.
@@ -51,24 +53,22 @@ func Run(ctx context.Context, argv []string, warn func(string)) (int, error) {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
+	setupChild(cmd)
+
 	if err := cmd.Start(); err != nil {
 		return ExitCannotLaunch, fmt.Errorf("starting %s: %w", argv[0], err)
 	}
 
-	j, jerr := newJob()
-	if jerr == nil {
-		if aerr := j.assign(cmd.Process.Pid); aerr != nil {
-			j.close()
-			j = nil
-			jerr = aerr
+	g, gerr := newChildGuard(cmd.Process.Pid)
+	if gerr != nil {
+		g = nil
+		if warn != nil {
+			warn(fmt.Sprintf("could not set up child process guard (%v); relying on heartbeat recovery", gerr))
 		}
 	}
-	if jerr != nil && warn != nil {
-		warn(fmt.Sprintf("could not attach child to job object (%v); relying on heartbeat recovery", jerr))
-	}
 	defer func() {
-		if j != nil {
-			j.close()
+		if g != nil {
+			g.close()
 		}
 	}()
 
@@ -79,11 +79,17 @@ func Run(ctx context.Context, argv []string, warn func(string)) (int, error) {
 	case werr := <-done:
 		return childExitCode(werr), nil
 	case <-ctx.Done():
+		if g != nil {
+			// On Unix the child's own process group never sees the
+			// terminal's Ctrl+C, so forward the interrupt (no-op on
+			// Windows, where the shared console already delivered it).
+			g.interrupt()
+		}
 		select {
 		case <-done:
 		case <-time.After(interruptGrace):
-			if j != nil {
-				j.terminate()
+			if g != nil {
+				g.terminate()
 			} else {
 				cmd.Process.Kill()
 			}

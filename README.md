@@ -4,13 +4,13 @@ Machine-global, named, FIFO-exclusive execution of locally launched workloads.
 
 `workgate` lets multiple coding-agent sessions (Codex, Claude Code, plain
 terminals) — across different projects, Git repositories, and worktrees on the
-same Windows workstation — serialize workloads that need exclusive access to a
-shared machine-level resource (e.g. a GPU, a hardware test rig, a licensed
-toolchain seat). It is a small local coordination primitive, not a job
-scheduler: no daemon, no server, no configuration.
+same machine (Windows, macOS, or Linux) — serialize workloads that need
+exclusive access to a shared machine-level resource (e.g. a GPU, a hardware
+test rig, a licensed toolchain seat). It is a small local coordination
+primitive, not a job scheduler: no daemon, no server, no configuration.
 
-```powershell
-workgate run gpu --label "Run integration tests" -- test-runner.exe --suite integration
+```sh
+workgate run gpu --label "Run integration tests" -- test-runner --suite integration
 ```
 
 Workloads targeting the same resource run strictly one at a time, in arrival
@@ -61,29 +61,34 @@ WAITING
 
 ## Scope
 
-Coordination state lives in one machine-user-global SQLite database:
+Coordination state lives in one machine-user-global SQLite database, in the
+platform's per-user cache directory (created on demand):
 
 ```text
-%LOCALAPPDATA%\Workgate\workgate.db
+Windows   %LOCALAPPDATA%\Workgate\workgate.db
+macOS     ~/Library/Caches/Workgate/workgate.db
+Linux     $XDG_CACHE_HOME/Workgate/workgate.db   (default ~/.cache/...)
 ```
 
-(resolved via the platform's Local AppData mechanism, created on demand).
-Every `workgate` process for the current Windows user shares it, so `gpu`
-means the same resource no matter which project, repository, worktree, or
-non-Git directory invoked it. Git information (repo root, common dir, branch)
+The database holds only live coordination rows — completed workloads are
+deleted, so deleting the file merely resets an idle queue. Every `workgate`
+process for the current OS user shares it, so `gpu` means the same resource
+no matter which project, repository, worktree, or non-Git directory invoked
+it. Git information (repo root, common dir, branch)
 is recorded as diagnostic metadata only — it never affects locking. If a
 project-specific resource is needed, encode it in the name
 (e.g. `myproject-build`).
 
 ## Build
 
-Requires Go 1.24+ (no CGO; SQLite via pure-Go `modernc.org/sqlite`).
+Requires Go 1.25+ (no CGO; SQLite via pure-Go `modernc.org/sqlite`).
 
-```powershell
-go build -o workgate.exe ./cmd/workgate
+```sh
+go build -o workgate ./cmd/workgate
 ```
 
-The result is a single self-contained `workgate.exe` — no runtime, no DLLs.
+(On Windows, use `-o workgate.exe`.) The result is a single self-contained
+binary — no runtime, no shared libraries.
 
 ## Install (Windows)
 
@@ -103,6 +108,22 @@ because the exe is in use, an active workload is still running — check
 
 Alternatively, install by hand: build with `go build -o workgate.exe
 ./cmd/workgate` and copy the exe into any directory already on `PATH`.
+
+## Install (macOS / Linux)
+
+From the repository root:
+
+```bash
+./install.sh
+```
+
+This runs the tests, builds `workgate`, and installs it to `~/.local/bin`
+(created if needed). If that directory is not on your `PATH`, the script
+prints the line to add to your shell profile. Re-run it after any source
+change to deploy the new build (`--skip-tests` skips the test run).
+
+Alternatively, install by hand: build with `go build -o workgate
+./cmd/workgate` and copy the binary into any directory already on `PATH`.
 
 ## Instructing AI agents to use workgate
 
@@ -157,7 +178,7 @@ Rules:
 Tips for adapting the snippet:
 
 - **Enumerate resources concretely.** "Use workgate for exclusive things" is
-  too vague for an agent to apply; "any command that runs `render-tool.exe`
+  too vague for an agent to apply; "any command that runs `render-tool`
   uses the `gpu` resource" is followed reliably. One bullet per resource,
   with the trigger commands named.
 - **Warn about the wait explicitly.** The most common agent failure mode is
@@ -218,9 +239,14 @@ The lifecycle:
    race acquisition, and a newer workload can never overtake a healthy older
    waiter.
 4. **Run** — the child runs with stdio forwarded; the database is untouched
-   except for heartbeats. The child is placed in a Windows Job Object with
+   except for heartbeats. The child's process tree is tied to workgate
+   per platform: on Windows it is placed in a Job Object with
    *kill-on-close*, so if workgate dies for any reason — including a hard
-   kill — the OS terminates the child's process tree.
+   kill — the OS terminates the child's process tree. On macOS/Linux the
+   child runs in its own process group; on interrupt workgate signals the
+   whole group with SIGINT, then SIGKILL after the grace period, and Linux
+   additionally arms `PR_SET_PDEATHSIG` so a hard-killed workgate takes the
+   direct child with it.
 5. **Release** — one transaction deletes the row (deferred-path, automatic;
    also on Ctrl+C after terminating the child). Completed workloads are
    deleted, not archived.
@@ -239,7 +265,7 @@ child is never at risk: heartbeats continue regardless of child output.
 
 ## Development
 
-```powershell
+```sh
 go test ./...
 ```
 
@@ -251,10 +277,20 @@ shorten timings; they are not user-facing configuration.
 
 ## Intentional limitations
 
-- Scope is per Windows user account (the DB lives under that user's
-  `%LOCALAPPDATA%`); different Windows users on one machine do not contend.
+- Scope is per OS user account (the DB lives under that user's cache
+  directory, see [Scope](#scope)); different users on one machine do not
+  contend.
 - Recovery after a hard kill takes up to the stale threshold (~60 s) — the
   price of being conservative about false-positive stale detection.
+- On macOS/Linux there is no exact equivalent of the Windows kill-on-close
+  Job Object: if workgate itself is killed with SIGKILL, the running child
+  can be orphaned (on Linux the direct child is still killed via
+  `PR_SET_PDEATHSIG`; its descendants, and everything on macOS, keep
+  running). The queue itself always recovers via heartbeat staleness.
+- On macOS/Linux the child runs in its own process group, so a wrapped
+  command that reads from the terminal is stopped by `SIGTTIN`. Wrap
+  non-interactive workloads only — which matches the tool's agent-driven
+  purpose.
 - Waiting uses sub-second polling rather than event-driven wakeup; the
   database traffic involved is negligible.
 - Deliberately excluded: explicit acquire/release commands, multi-resource

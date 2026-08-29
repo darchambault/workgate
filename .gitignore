@@ -1,2 +1,4 @@
 workgate.exe
 *.exe
+# Unix build artifact (root-anchored so cmd/workgate/ stays tracked)
+/workgate
