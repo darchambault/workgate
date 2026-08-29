@@ -87,18 +87,22 @@ The result is a single self-contained `workgate.exe` — no runtime, no DLLs.
 
 ## Install (Windows)
 
-Put `workgate.exe` on `PATH`. For example:
+From the repository root:
 
 ```powershell
-New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\Programs\workgate" | Out-Null
-Copy-Item workgate.exe "$env:LOCALAPPDATA\Programs\workgate\"
-[Environment]::SetEnvironmentVariable("Path",
-  [Environment]::GetEnvironmentVariable("Path","User") + ";$env:LOCALAPPDATA\Programs\workgate",
-  "User")
+.\install.ps1
 ```
 
-(Open a new terminal afterwards.) Alternatively copy it into any directory
-already on `PATH`.
+This runs the tests, builds `workgate.exe`, copies it to
+`%LOCALAPPDATA%\Programs\workgate`, and adds that directory to the user
+`PATH` if it isn't there yet. Re-run it after any source change to deploy the
+new build (`-SkipTests` skips the test run). Already-open terminals keep
+their old `PATH`; new ones see `workgate` immediately. If the copy fails
+because the exe is in use, an active workload is still running — check
+`workgate status` and re-run once it finishes.
+
+Alternatively, install by hand: build with `go build -o workgate.exe
+./cmd/workgate` and copy the exe into any directory already on `PATH`.
 
 ## Instructing AI agents to use workgate
 
