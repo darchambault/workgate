@@ -296,3 +296,18 @@ shorten timings; they are not user-facing configuration.
 - Deliberately excluded: explicit acquire/release commands, multi-resource
   acquisition, priorities, retries, history, daemons, networking, and
   per-project scopes.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Use it freely, including in commercial and
+closed-source work; the only condition is that the copyright notice travels
+with copies of the software.
+
+workgate wraps child commands across a process boundary (separate address
+space, communication limited to argv, stdio, and an exit code). Wrapping a
+command with workgate has no effect whatsoever on that command's licensing.
+
+All dependencies are permissive (BSD-3-Clause and MIT); none impose copyleft
+or source-disclosure obligations. Their license texts are reproduced in
+[THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES), which should be included
+alongside any binary distribution of workgate.
