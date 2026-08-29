@@ -1,0 +1,4 @@
+# Keep LF in working copies everywhere (Windows runners default to
+# autocrlf=true, which would make gofmt flag every file).
+* text=auto eol=lf
+*.exe binary
