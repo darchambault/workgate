@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Check formatting
+        run: |
+          $files = gofmt -l .
+          if ($files) { Write-Output "gofmt needed:"; Write-Output $files; exit 1 }
+      - name: Vet
+        run: go vet ./...
+      - name: Build
+        run: go build -o workgate.exe ./cmd/workgate
+      - name: Test (includes multi-process e2e)
+        run: go test ./... -count=1 -timeout 10m
+
+  # The tool targets Windows, but the non-Windows stub (job_other.go) should
+  # keep compiling so a cross-platform port stays cheap.
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: go build ./...
