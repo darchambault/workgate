@@ -5,12 +5,12 @@ Machine-global, named, FIFO-exclusive execution of locally launched workloads.
 `workgate` lets multiple coding-agent sessions (Codex, Claude Code, plain
 terminals) — across different projects, Git repositories, and worktrees on the
 same Windows workstation — serialize workloads that need exclusive access to a
-shared machine-level resource (e.g. a Unity editor/project, a Steam upload
-slot). It is a small local coordination primitive, not a job scheduler: no
-daemon, no server, no configuration.
+shared machine-level resource (e.g. a GPU, a hardware test rig, a licensed
+toolchain seat). It is a small local coordination primitive, not a job
+scheduler: no daemon, no server, no configuration.
 
 ```powershell
-workgate run unity --label "Run EditMode tests" -- Unity.exe -batchmode ...
+workgate run gpu --label "Run integration tests" -- test-runner.exe --suite integration
 ```
 
 Workloads targeting the same resource run strictly one at a time, in arrival
@@ -28,7 +28,7 @@ workgate status [<resource>]
 - Everything after `--` is the child command, passed through verbatim
   (no shell interpretation; quote arguments for your own shell as usual).
 - Resource names: `[a-zA-Z0-9][a-zA-Z0-9._-]*`, max 64 chars, case-insensitive
-  (`Unity`, `UNITY`, and `unity` share one queue).
+  (`GPU`, `Gpu`, and `gpu` share one queue).
 - `--label` is diagnostic only; without it a label is derived from the command.
 - The child's exit code is propagated. Workgate's own failures use distinct
   codes: `2` usage error, `125` internal error, `126` cannot launch, `127`
@@ -38,24 +38,24 @@ workgate status [<resource>]
 Typical output:
 
 ```text
-[workgate] Queued for "unity" (position 3): Run EditMode tests
-[workgate] Acquired "unity"
+[workgate] Queued for "gpu" (position 3): Run integration tests
+[workgate] Acquired "gpu"
 ...child output...
-[workgate] Released "unity"
+[workgate] Released "gpu"
 ```
 
 ```text
-> workgate status unity
-RESOURCE: unity
+> workgate status gpu
+RESOURCE: gpu
 
 RUNNING
   49ce3e   "Workload-A"                     00:04
-           project: AirportTycoon
+           project: MyProject
            pid: 77900
 
 WAITING
   1eabb7   "Workload-B"                     00:02
-           project: OtherUnityGame
+           project: OtherProject
            pid: 64732
 ```
 
@@ -68,12 +68,12 @@ Coordination state lives in one machine-user-global SQLite database:
 ```
 
 (resolved via the platform's Local AppData mechanism, created on demand).
-Every `workgate` process for the current Windows user shares it, so `unity`
+Every `workgate` process for the current Windows user shares it, so `gpu`
 means the same resource no matter which project, repository, worktree, or
 non-Git directory invoked it. Git information (repo root, common dir, branch)
 is recorded as diagnostic metadata only — it never affects locking. If a
 project-specific resource is needed, encode it in the name
-(e.g. `airport-tycoon-build`).
+(e.g. `myproject-build`).
 
 ## Build
 
@@ -125,8 +125,8 @@ Run any such operation through workgate:
 
 Defined shared resources:
 
-- `unity` — ANY command that opens or drives the Unity editor or runs
-  Unity in batch mode (tests, builds, asset imports, project generation).
+- `gpu` — ANY command that requires exclusive access to the GPU
+  (rendering, ML training, hardware-accelerated tests).
 
 Rules:
 
@@ -157,9 +157,9 @@ Rules:
 Tips for adapting the snippet:
 
 - **Enumerate resources concretely.** "Use workgate for exclusive things" is
-  too vague for an agent to apply; "any command that runs `Unity.exe` uses
-  the `unity` resource" is followed reliably. One bullet per resource, with
-  the trigger commands named.
+  too vague for an agent to apply; "any command that runs `render-tool.exe`
+  uses the `gpu` resource" is followed reliably. One bullet per resource,
+  with the trigger commands named.
 - **Warn about the wait explicitly.** The most common agent failure mode is
   treating a queued (and deliberately quiet) workgate as a hung command —
   killing it, retrying, or bypassing the queue. Rules 3–4 above exist for
@@ -168,7 +168,7 @@ Tips for adapting the snippet:
   wrapped command in the background for potentially long queues.
 - **Require labels.** Labels are how a human (or another agent) looking at
   `workgate status` understands who is blocking whom. Session/task context
-  ("Claude: run EditMode tests for PR 42") beats a generic "tests".
+  ("Claude: run integration tests for PR 42") beats a generic "tests".
 - **Keep the wrapped span tight.** One `workgate run` per exclusive
   operation — not one per shell command inside it, and not a whole
   multi-step task that only briefly needs the resource.
@@ -230,7 +230,7 @@ runs, its row simply stops heartbeating; the next acquisition attempt (or
 `workgate status`) removes it after the 60-second stale threshold and reports:
 
 ```text
-[workgate] Removed stale workload fd2b09 from "unity"
+[workgate] Removed stale workload fd2b09 from "gpu"
 ```
 
 The threshold is 12× the heartbeat interval, deliberately conservative against
