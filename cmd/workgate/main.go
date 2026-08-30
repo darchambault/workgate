@@ -3,6 +3,7 @@
 //
 //	workgate run <resource> [--label "<text>"] -- <command> [args...]
 //	workgate status [<resource>]
+//	workgate monitor [<resource>] [--interval <duration>]
 package main
 
 import (
@@ -26,10 +27,14 @@ const usage = `workgate - machine-global FIFO-exclusive execution of local workl
 Usage:
   workgate run <resource> [--label "<description>"] -- <command> [args...]
   workgate status [<resource>]
+  workgate monitor [<resource>] [--interval <duration>]
 
 Workloads targeting the same resource execute one at a time, in strict
 arrival order, across all projects and terminals on this machine. The
 resource is released automatically when the wrapped command exits.
+
+"monitor" is "status" as a live, full-screen view: it redraws once per
+second until interrupted with Ctrl+C, and never modifies the queue.
 
 Resource names: [a-zA-Z0-9][a-zA-Z0-9._-]* (case-insensitive, max 64 chars).
 `
@@ -49,6 +54,8 @@ func realMain(args []string) int {
 		return cmdRun(args[1:])
 	case "status":
 		return cmdStatus(args[1:])
+	case "monitor":
+		return cmdMonitor(args[1:])
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 		return 0
@@ -230,12 +237,26 @@ func cmdStatus(args []string) int {
 		fmt.Println("No active workgate workloads.")
 		return 0
 	}
-	printStatus(workloads)
+	// status is plain text: the styles statusLines attaches are only ever
+	// rendered by the monitor.
+	for _, l := range statusLines(workloads, time.Now().UnixMilli(), false) {
+		fmt.Println(l.plain())
+	}
 	return 0
 }
 
-func printStatus(workloads []queue.Workload) {
-	now := time.Now().UnixMilli()
+// statusLines renders workloads as display lines, grouped by resource and
+// split into RUNNING/WAITING sections. Both `status` and `monitor` format
+// through here so the two views cannot drift apart.
+//
+// compact folds project and pid onto the entry line and flags entries whose
+// heartbeat has gone stale; the monitor needs one line per workload to fit a
+// fixed-height screen. Non-compact is the multi-line `status` layout.
+//
+// Styles are attached to every line in both modes. They cost nothing where
+// they are unwanted — status prints line.plain(), and the monitor drops them
+// when stdout is redirected or NO_COLOR is set.
+func statusLines(workloads []queue.Workload, now int64, compact bool) []line {
 	byResource := map[string][]queue.Workload{}
 	var order []string
 	for _, w := range workloads {
@@ -244,37 +265,67 @@ func printStatus(workloads []queue.Workload) {
 		}
 		byResource[w.Resource] = append(byResource[w.Resource], w)
 	}
+	var out []line
 	for i, res := range order {
 		if i > 0 {
-			fmt.Println()
+			out = append(out, plainLine(""))
 		}
-		fmt.Printf("RESOURCE: %s\n", res)
+		out = append(out, styledLine(styleBold, fmt.Sprintf("RESOURCE: %s", res)))
 		section := ""
 		for _, w := range byResource[res] {
-			header := "WAITING"
+			header, style := "WAITING", styleWaiting
 			since := w.CreatedAt
 			if w.State == "running" {
-				header = "RUNNING"
+				header, style = "RUNNING", styleRunning
 				since = w.AcquiredAt
 			}
 			if header != section {
 				section = header
-				fmt.Printf("\n%s\n", header)
+				out = append(out, plainLine(""), styledLine(style, header))
 			}
 			label := w.Label
 			if label == "" {
 				label = "(no label)"
 			}
-			fmt.Printf("  %-8s %-32s %s\n", w.ID, fmt.Sprintf("%q", label),
-				fmtElapsed(time.Duration(now-since)*time.Millisecond))
+			// Spans reproduce "  %-8s %-32s %s" exactly, split so the id can be
+			// dimmed: it identifies a row but is rarely what the eye wants.
+			entry := line{
+				{text: "  "},
+				{text: fmt.Sprintf("%-8s", w.ID), style: styleDim},
+				{text: " " + fmt.Sprintf("%-32s", fmt.Sprintf("%q", label))},
+				{text: " " + fmtElapsed(time.Duration(now-since)*time.Millisecond)},
+			}
+			if !compact {
+				out = append(out, entry)
+				if p := displayProject(w); p != "" {
+					out = append(out, plainLine(fmt.Sprintf("           project: %s", p)))
+				}
+				if w.PID != 0 {
+					out = append(out, plainLine(fmt.Sprintf("           pid: %d", w.PID)))
+				}
+				continue
+			}
+			// The monitor never removes stale rows, so it labels them instead:
+			// this owner has stopped heartbeating, and the next run or status
+			// will clear the entry.
+			//
+			// The marker goes before project and pid deliberately. A narrow
+			// terminal truncates the end of the line, and losing "[STALE]"
+			// would hide the very thing the row is trying to say; losing the
+			// project name costs far less.
+			if now-w.HeartbeatAt > queue.StaleThreshold.Milliseconds() {
+				entry = append(entry, span{text: "  [STALE]", style: styleAlert})
+			}
 			if p := displayProject(w); p != "" {
-				fmt.Printf("           project: %s\n", p)
+				entry = append(entry, span{text: "  " + p})
 			}
 			if w.PID != 0 {
-				fmt.Printf("           pid: %d\n", w.PID)
+				entry = append(entry, span{text: fmt.Sprintf("  pid %d", w.PID), style: styleDim})
 			}
+			out = append(out, entry)
 		}
 	}
+	return out
 }
 
 // displayProject prefers the Git-derived repository name and falls back to

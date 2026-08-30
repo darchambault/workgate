@@ -417,3 +417,70 @@ func TestContentionAcrossIndependentRepositories(t *testing.T) {
 	a.cmd.Process.Kill()
 	b.cmd.Process.Kill()
 }
+
+// TestMonitorRendersLiveQueue drives the monitor with stdout on a pipe, which
+// selects its non-TTY path: no escape sequences, one appended frame per
+// interval. The alternate-screen path cannot be exercised without a real
+// console, so it is verified by hand.
+func TestMonitorRendersLiveQueue(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "wg.db")
+	env := fastEnv(dbPath)
+	d := openTestDB(t, dbPath)
+
+	a := startWG(t, dir, env, "run", "monitor-res", "--label", "Held workload", "--",
+		helperExe, "-sleep", "20s")
+	waitFor(t, 15*time.Second, "A running", func() bool {
+		ws := listState(t, d, "monitor-res")
+		return len(ws) == 1 && ws[0].State == "running"
+	})
+	b := startWG(t, dir, env, "run", "monitor-res", "--label", "Queued workload", "--",
+		helperExe, "-exit", "0")
+	waitFor(t, 15*time.Second, "B waiting", func() bool {
+		return len(listState(t, d, "monitor-res")) == 2
+	})
+
+	m := startWG(t, dir, env, "monitor", "monitor-res", "--interval", "200ms")
+	waitFor(t, 15*time.Second, "two monitor frames", func() bool {
+		return strings.Count(m.output(), "workgate monitor - monitor-res") >= 2
+	})
+
+	text := m.output()
+	for _, want := range []string{"RESOURCE: monitor-res", "RUNNING", "WAITING",
+		"Held workload", "Queued workload", "refreshing every 200ms"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("monitor output missing %q:\n%s", want, text)
+		}
+	}
+	// The non-TTY path must stay pipe-friendly.
+	if strings.Contains(text, "\x1b[") {
+		t.Errorf("monitor emitted escape sequences to a pipe:\n%q", text)
+	}
+	// Monitoring is read-only: both workloads must still be queued.
+	if ws := listState(t, d, "monitor-res"); len(ws) != 2 {
+		t.Errorf("monitor changed the queue: %d workloads remain, want 2", len(ws))
+	}
+
+	m.cmd.Process.Kill()
+	a.cmd.Process.Kill()
+	b.cmd.Process.Kill()
+}
+
+// TestMonitorRejectsBadArguments covers the usage paths, which must fail fast
+// rather than opening a full-screen view.
+func TestMonitorRejectsBadArguments(t *testing.T) {
+	env := fastEnv(filepath.Join(t.TempDir(), "wg.db"))
+	for _, args := range [][]string{
+		{"monitor", "not a resource"},
+		{"monitor", "--interval", "10ms"},
+		{"monitor", "--nope"},
+	} {
+		cmd := exec.Command(workgateExe, args...)
+		cmd.Env = append(os.Environ(), env...)
+		out, err := cmd.CombinedOutput()
+		var ee *exec.ExitError
+		if !isExitError(err, &ee) || ee.ExitCode() != 2 {
+			t.Errorf("%v: exit = %v, want usage error 2\n%s", args, err, out)
+		}
+	}
+}

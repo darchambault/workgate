@@ -23,6 +23,7 @@ is killed outright, recovered automatically via heartbeat staleness.
 ```text
 workgate run <resource> [--label "<description>"] -- <command> [args...]
 workgate status [<resource>]
+workgate monitor [<resource>] [--interval <duration>]
 ```
 
 - Everything after `--` is the child command, passed through verbatim
@@ -30,6 +31,7 @@ workgate status [<resource>]
 - Resource names: `[a-zA-Z0-9][a-zA-Z0-9._-]*`, max 64 chars, case-insensitive
   (`GPU`, `Gpu`, and `gpu` share one queue).
 - `--label` is diagnostic only; without it a label is derived from the command.
+- `monitor` is `status` as a live view; see [Monitoring](#monitoring) below.
 - The child's exit code is propagated. Workgate's own failures use distinct
   codes: `2` usage error, `125` internal error, `126` cannot launch, `127`
   command not found, `130` interrupted.
@@ -58,6 +60,51 @@ WAITING
            project: OtherProject
            pid: 64732
 ```
+
+### Monitoring
+
+`workgate monitor` is the same information as a live view: it takes over the
+terminal, redraws once per second, and runs until you stop it with Ctrl+C.
+Use it to watch a contended resource instead of re-running `status` in a loop.
+
+```text
+workgate monitor [<resource>] [--interval <duration>]
+```
+
+```text
+workgate monitor - gpu - 19:42:07
+
+RESOURCE: gpu
+
+RUNNING
+  49ce3e   "Workload-A"                     00:04  MyProject  pid 77900
+
+WAITING
+  1eabb7   "Workload-B"                     00:02  OtherProject  pid 64732
+
+refreshing every 1s - Ctrl+C to stop
+```
+
+- Without a resource it watches every resource, grouped, exactly as `status`
+  does. `--interval` accepts any Go duration (`2s`, `500ms`); the default is
+  `1s` and the minimum is `100ms`.
+- The view uses the terminal's alternate screen buffer, so your scrollback is
+  untouched: on exit the terminal is restored and nothing is left behind.
+  Resizing the window mid-run is fine — each frame is re-fitted.
+- **Monitoring never modifies the queue.** Unlike `status`, it does not remove
+  abandoned workloads; it labels them `[STALE]` and leaves them to the next
+  `run` or `status`. Watching a resource should not change who owns it. (The
+  database is still opened normally, which applies the idempotent
+  `CREATE TABLE IF NOT EXISTS` schema step — "read-only" means no queue
+  mutation, not zero writes.)
+- Restrained colour picks out the structure: section headings (green for
+  RUNNING, yellow for WAITING), a red `[STALE]`, and dimmed chrome so the
+  eye lands on the workloads. Colour is never the only signal — every state
+  it distinguishes is also written out — and setting `NO_COLOR` to any value
+  turns it off while keeping the live redraw.
+- Redirected output (`workgate monitor gpu | tee watch.log`) emits no escape
+  sequences at all: frames are simply appended, one per interval, unstyled
+  and untruncated.
 
 ## Scope
 
@@ -193,6 +240,10 @@ Tips for adapting the snippet:
 - **Keep the wrapped span tight.** One `workgate run` per exclusive
   operation — not one per shell command inside it, and not a whole
   multi-step task that only briefly needs the resource.
+- **Point agents at `status`, not `monitor`.** `monitor` runs until
+  interrupted, so an agent that starts one never gets its command back.
+  It is a human's window onto the queue; `workgate status <resource>` is
+  the one-shot form an agent should use.
 
 ## How it works
 
