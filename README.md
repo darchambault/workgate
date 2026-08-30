@@ -22,7 +22,7 @@ is killed outright, recovered automatically via heartbeat staleness.
 
 ```text
 workgate run <resource> [--label "<description>"] -- <command> [args...]
-workgate status [<resource>]
+workgate status [<resource>] [--recent[=<count>]]
 workgate monitor [<resource>] [--interval <duration>]
 ```
 
@@ -32,6 +32,9 @@ workgate monitor [<resource>] [--interval <duration>]
   (`GPU`, `Gpu`, and `gpu` share one queue).
 - `--label` is diagnostic only; without it a label is derived from the command.
 - `monitor` is `status` as a live view; see [Monitoring](#monitoring) below.
+- `--recent` appends the last few workloads that finished, and how each one
+  ended; see [Recent completions](#recent-completions). `monitor` always shows
+  them. Without the flag, `status` output is unchanged.
 - The child's exit code is propagated. Workgate's own failures use distinct
   codes: `2` usage error, `125` internal error, `126` cannot launch, `127`
   command not found, `130` interrupted.
@@ -82,6 +85,11 @@ RUNNING
 WAITING
   1eabb7   pid 64732  00:02    "Workload-B"                      MyApp [fix-42]
 
+LAST COMPLETED
+  b0d41c   ok         00:03    "Workload-Z"                      (just now)  MyApp [main]
+  7f2a90   exit 1     00:00    "Workload-Y"                      (2m ago)    MyApp [fix-42]
+  3c4d5e   stale      00:31    "Workload-X"                      (18m ago)   Other [main]
+
 refreshing every 1s - Ctrl+C to stop
 ```
 
@@ -100,16 +108,56 @@ refreshing every 1s - Ctrl+C to stop
   `CREATE TABLE IF NOT EXISTS` schema step — "read-only" means no queue
   mutation, not zero writes.)
 - Restrained colour picks out the structure: section headings (green for
-  RUNNING, yellow for WAITING), a red `[STALE]`, and dimmed chrome so the
-  eye lands on the workloads. Colour is never the only signal — every state
-  it distinguishes is also written out — and setting `NO_COLOR` to any value
-  turns it off while keeping the live redraw.
+  RUNNING, yellow for WAITING), a red `[STALE]` and a red failing outcome,
+  and dimmed chrome so the eye lands on the workloads. Colour is never the
+  only signal — every state it distinguishes is also written out — and setting
+  `NO_COLOR` to any value turns it off while keeping the live redraw.
 - Redirected output (`workgate monitor gpu | tee watch.log`) emits no escape
   sequences at all: frames are simply appended, one per interval, unstyled
   and untruncated.
 - Ctrl+C is how a monitor is meant to end, so it exits `0`. The `130`
   interrupted code listed above belongs to `run`, where an interrupt cuts a
   child command short.
+
+### Recent completions
+
+A workload that finishes disappears from the queue, which leaves the question
+a monitor is most often being asked — *did my build finish, and how?* — with
+nowhere to look. `monitor` therefore ends with a `LAST COMPLETED` section, and
+`status --recent` shows the same thing on demand:
+
+```text
+> workgate status gpu --recent
+No active workgate workloads.
+
+LAST COMPLETED
+  b0d41c   ok         00:03    "Workload-Z"                      (just now)
+                               project: MyApp [main]
+  7f2a90   exit 1     00:00    "Workload-Y"                      (2m ago)
+                               project: MyApp [fix-42]
+```
+
+- A finished row sits on the same columns as a live one, so a frame reads as
+  one table. The column a live workload spends on its pid carries the
+  **outcome** instead — a pid is not merely useless once the process is gone,
+  it is misleading, because pids get recycled. The timer column carries how
+  long the workload **ran**; the list is already newest-first, so the age in
+  brackets is what says when.
+- Outcomes are `ok`, `exit <code>`, `killed` (signalled, or crashed),
+  `canceled` (interrupted mid-run), and `stale` (the owner stopped
+  heartbeating and was reclaimed). Everything that held the resource is
+  recorded, so a hard-killed workload leaves a trace rather than vanishing —
+  though, since `monitor` never modifies the queue, such a workload reads
+  `[STALE]` in the live section until the next `run` or `status` reclaims it
+  and moves it down here.
+- `monitor` always shows three. `status` shows none unless asked: `--recent`
+  for three, `--recent=<count>` for up to ten.
+- The section is last on screen, so a window too short for everything drops it
+  before the live queue — which is the right way round, the queue being what
+  the tool is for.
+- This is a bounded ring, not history: at most ten completions per resource,
+  expiring after a day, with nothing to query them beyond the last few. See
+  [Scope](#scope).
 
 ## Scope
 
@@ -122,9 +170,12 @@ macOS     ~/Library/Caches/Workgate/workgate.db
 Linux     $XDG_CACHE_HOME/Workgate/workgate.db   (default ~/.cache/...)
 ```
 
-The database holds only live coordination rows — completed workloads are
-deleted, so deleting the file merely resets an idle queue. Every `workgate`
-process for the current OS user shares it, so `gpu` means the same resource
+The database holds live coordination rows plus a small bounded ring of recent
+completions (at most ten per resource, expiring after a day — see
+[Recent completions](#recent-completions)). Nothing in it is durable history,
+and nothing reads the ring to make a coordination decision, so deleting the
+file merely resets an idle queue and forgets what finished recently. Every
+`workgate` process for the current OS user shares it, so `gpu` means the same resource
 no matter which project, repository, worktree, or non-Git directory invoked
 it. Git information (repo root, common dir, branch)
 is recorded as diagnostic metadata only — it never affects locking. If a
@@ -252,7 +303,7 @@ Tips for adapting the snippet:
 
 ## How it works
 
-One SQLite table is the entire coordination state:
+One SQLite table holds the entire coordination state:
 
 ```sql
 CREATE TABLE workloads (
@@ -272,7 +323,29 @@ CREATE INDEX idx_workloads_resource_seq ON workloads(resource, seq);
 CREATE UNIQUE INDEX idx_one_running ON workloads(resource) WHERE state = 'running';
 ```
 
-- **FIFO** is the `seq` autoincrement, never timestamps.
+A second table holds the recent-completions ring. Nothing reads it to make a
+coordination decision; it exists only so `monitor` and `status --recent` can
+say what just finished:
+
+```sql
+CREATE TABLE completions (
+  seq         INTEGER PRIMARY KEY AUTOINCREMENT,  -- completion order
+  id          TEXT NOT NULL,                      -- deliberately not unique
+  resource    TEXT NOT NULL,
+  label       TEXT,
+  outcome     TEXT NOT NULL,                      -- ok|exit|killed|canceled|stale
+  exit_code   INTEGER NOT NULL DEFAULT 0,
+  started_at  INTEGER NOT NULL, finished_at INTEGER NOT NULL,
+  working_directory TEXT, repository_root TEXT, git_branch TEXT
+);
+CREATE INDEX idx_completions_resource_seq ON completions(resource, seq);
+```
+
+- **FIFO** is the `seq` autoincrement, never timestamps — in both tables, so
+  that a clock that jumps cannot reorder either the queue or the ring.
+- `completions.id` is deliberately not unique: a workload id is three random
+  bytes, unique only among live rows, and a cosmetic collision must never be
+  able to fail a release and strand a resource.
 - The partial unique index makes a second `running` row per resource
   impossible at the database level, independent of application logic.
 - Non-default pragmas (chosen deliberately): `journal_mode=WAL` (readers never
@@ -303,9 +376,12 @@ The lifecycle:
    whole group with SIGINT, then SIGKILL after the grace period, and Linux
    additionally arms `PR_SET_PDEATHSIG` so a hard-killed workgate takes the
    direct child with it.
-5. **Release** — one transaction deletes the row (deferred-path, automatic;
-   also on Ctrl+C after terminating the child). Completed workloads are
-   deleted, not archived.
+5. **Release** — one transaction deletes the row and, if the workload actually
+   held the resource, records how it ended in the completions ring
+   (deferred-path, automatic; also on Ctrl+C after terminating the child).
+   Deleting and recording together is what stops a crash between the two from
+   leaving a resource held. Completed workloads are removed from the queue and
+   summarised, not archived.
 
 **Crash recovery:** if a workgate process is killed so hard that no cleanup
 runs, its row simply stops heartbeating; the next acquisition attempt (or
@@ -314,6 +390,9 @@ runs, its row simply stops heartbeating; the next acquisition attempt (or
 ```text
 [workgate] Removed stale workload fd2b09 from "gpu"
 ```
+
+The reclaimed workload is recorded as `stale` in the completions ring at the
+same moment, so a hard kill leaves a trace rather than vanishing.
 
 The threshold is 12× the heartbeat interval, deliberately conservative against
 machine sleep, debugger pauses, and scheduling stalls. A healthy 30-minute
@@ -326,7 +405,8 @@ go test ./...
 ```
 
 Tests include multi-process end-to-end coverage (FIFO across real processes,
-hard-kill recovery, exit-code propagation). `monitor` is covered through its
+hard-kill recovery, exit-code propagation, and completions surviving both a
+clean exit and a hard kill). `monitor` is covered through its
 redirected-output path, and its escape sequences are asserted directly; the
 alternate-screen view itself needs a real console, so changes to it are worth
 running by eye. Environment variables
@@ -358,8 +438,11 @@ shorten timings; they are not user-facing configuration.
   terminal stranded by a hard kill is recovered with `reset` on macOS/Linux,
   or by opening a new tab on Windows.
 - Deliberately excluded: explicit acquire/release commands, multi-resource
-  acquisition, priorities, retries, history, daemons, networking, and
-  per-project scopes.
+  acquisition, priorities, retries, daemons, networking, and per-project
+  scopes.
+- There is no history. The recent-completions ring is a display aid, bounded
+  at ten per resource and expiring after a day, with no command to query it
+  beyond the last few — not a record you can go back to.
 
 ## License
 

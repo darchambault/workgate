@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -279,10 +280,10 @@ func TestStatusLinesEmpty(t *testing.T) {
 }
 
 func TestMonitorBodyEmptyStates(t *testing.T) {
-	if got := monitorBody(nil, "", testNow); !strings.Contains(got[0].plain(), "No active workgate workloads.") {
+	if got := monitorBody(nil, nil, "", testNow); !strings.Contains(got[0].plain(), "No active workgate workloads.") {
 		t.Errorf("all-resources empty message = %q", got[0].plain())
 	}
-	if got := monitorBody(nil, "gpu", testNow); !strings.Contains(got[0].plain(), `"gpu"`) {
+	if got := monitorBody(nil, nil, "gpu", testNow); !strings.Contains(got[0].plain(), `"gpu"`) {
 		t.Errorf("single-resource empty message should name the resource, got %q", got[0].plain())
 	}
 }
@@ -451,5 +452,318 @@ func TestParseMonitorArgs(t *testing.T) {
 				t.Errorf("= (%q, %s), want (%q, %s)", resource, interval, tc.resource, tc.interval)
 			}
 		})
+	}
+}
+
+func testCompletion(id, resource, label, outcome string, exitCode int64, ranMS, agoMS int64) queue.Completion {
+	return queue.Completion{
+		ID: id, Resource: resource, Label: label,
+		Outcome: outcome, ExitCode: exitCode,
+		FinishedAt:     testNow - agoMS,
+		StartedAt:      testNow - agoMS - ranMS,
+		RepositoryRoot: "/src/proj",
+		GitBranch:      "main",
+	}
+}
+
+// TestCompletionLinesShareTheEntryGrid is the mirror of
+// TestStatusLinesEntryLayoutIsUnchangedBySpans: a finished row must land on
+// exactly the same columns as a live one, so a frame reads as one table.
+func TestCompletionLinesShareTheEntryGrid(t *testing.T) {
+	live := statusLines([]queue.Workload{
+		testWorkload("aaa", "gpu", "Holder", "running", 5000, 0),
+	}, testNow, true)
+	done := completionLines([]queue.Completion{
+		testCompletion("bbb", "gpu", "Finished", queue.OutcomeExit, 1, 5000, 0),
+	}, testNow, true, false)
+
+	liveEntry, doneEntry := "", ""
+	for _, l := range plainTexts(live) {
+		if strings.Contains(l, "Holder") {
+			liveEntry = l
+		}
+	}
+	for _, l := range plainTexts(done) {
+		if strings.Contains(l, "Finished") {
+			doneEntry = l
+		}
+	}
+	want := fmt.Sprintf("  %-8s %-10s %-8s %-32s", "bbb", "exit 1", "00:05", `"Finished"`)
+	if !strings.HasPrefix(doneEntry, want) {
+		t.Fatalf("completion entry = %q, want it to start %q", doneEntry, want)
+	}
+	// The label starts at the same column in both, which is the property
+	// that actually matters on screen.
+	if strings.Index(liveEntry, `"Holder"`) != strings.Index(doneEntry, `"Finished"`) {
+		t.Errorf("label columns differ:\n live %q\n done %q", liveEntry, doneEntry)
+	}
+}
+
+// TestOutcomeTextFitsTheColumn guards the invariant the fixed grid rests on:
+// %-*s pads but never truncates, so one over-long outcome would silently
+// shift every later column on that row.
+func TestOutcomeTextFitsTheColumn(t *testing.T) {
+	kinds := []string{
+		queue.OutcomeOK, queue.OutcomeExit, queue.OutcomeKilled,
+		queue.OutcomeCanceled, queue.OutcomeStale,
+	}
+	codes := []int64{0, 1, 255, -1, 3221225477}
+	for _, kind := range kinds {
+		for _, code := range codes {
+			s := outcomeSpan(queue.Completion{Outcome: kind, ExitCode: code})
+			if len(s.text) != pidWidth {
+				t.Errorf("outcomeSpan(%s, %d) width = %d, want exactly %d",
+					kind, code, len(s.text), pidWidth)
+			}
+		}
+	}
+	// outcomeFor is what keeps the wide codes out of the "exit N" branch.
+	for _, code := range []int{-1, 3221225477} {
+		if got := outcomeFor(code, nil); got.Kind != queue.OutcomeKilled {
+			t.Errorf("outcomeFor(%d) = %+v, want killed", code, got)
+		}
+	}
+}
+
+func TestOutcomeForClassifiesRuns(t *testing.T) {
+	tests := []struct {
+		name string
+		code int
+		err  error
+		want queue.Outcome
+	}{
+		{"clean exit", 0, nil, queue.Outcome{Kind: queue.OutcomeOK}},
+		{"failure", 3, nil, queue.Outcome{Kind: queue.OutcomeExit, ExitCode: 3}},
+		{"interrupted", 130, context.Canceled, queue.Outcome{Kind: queue.OutcomeCanceled}},
+		{"signalled", -1, nil, queue.Outcome{Kind: queue.OutcomeKilled}},
+		// A command that could not be launched is honestly described by the
+		// 126/127 the shell itself would report.
+		{"not found", 127, nil, queue.Outcome{Kind: queue.OutcomeExit, ExitCode: 127}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := outcomeFor(tc.code, tc.err); got != tc.want {
+				t.Errorf("outcomeFor(%d, %v) = %+v, want %+v", tc.code, tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCompletionLinesStyles(t *testing.T) {
+	cs := []queue.Completion{
+		testCompletion("aaa", "gpu", "Ok", queue.OutcomeOK, 0, 1000, 0),
+		testCompletion("bbb", "gpu", "Failed", queue.OutcomeExit, 1, 1000, 0),
+		testCompletion("ccc", "gpu", "Crashed", queue.OutcomeStale, 0, 1000, 0),
+		testCompletion("ddd", "gpu", "Stopped", queue.OutcomeCanceled, 0, 1000, 0),
+	}
+	got := completionLines(cs, testNow, true, false)
+	for _, tc := range []struct{ text, style string }{
+		{"ok", styleDim},
+		{"exit 1", styleAlert},
+		{"stale", styleAlert},
+		{"canceled", styleDim},
+	} {
+		style, ok := styleOf(got, tc.text)
+		if !ok {
+			t.Fatalf("no span containing %q", tc.text)
+		}
+		if style != tc.style {
+			t.Errorf("%q style = %q, want %q", tc.text, style, tc.style)
+		}
+	}
+	if style, ok := styleOf(got, completionsHeading); !ok || style != styleDim {
+		t.Errorf("heading style = %q (found %v), want %q", style, ok, styleDim)
+	}
+	// A completion with no label reads the same as a live one with none.
+	if !strings.Contains(plainText(completionLines(
+		[]queue.Completion{testCompletion("eee", "gpu", "", queue.OutcomeOK, 0, 0, 0)},
+		testNow, true, false)), `"(no label)"`) {
+		t.Error("an unlabelled completion should render as (no label)")
+	}
+}
+
+// TestCompletionSuffixOrderSurvivesTruncation mirrors
+// TestStatusLinesStaleMarkerSurvivesTruncation: a narrow terminal eats the
+// end of a line, so the suffixes are ordered by what costs least to lose.
+func TestCompletionSuffixOrderSurvivesTruncation(t *testing.T) {
+	cs := []queue.Completion{
+		testCompletion("aaa", "gpu", "a fairly long label here", queue.OutcomeExit, 9, 1000, 120000),
+	}
+	full := plainText(completionLines(cs, testNow, true, true))
+	res, age := strings.Index(full, "  gpu"), strings.Index(full, "(2m ago)")
+	proj := strings.Index(full, "proj [main]")
+	if res < 0 || age < 0 || proj < 0 {
+		t.Fatalf("expected resource, age and worktree on the row:\n%s", full)
+	}
+	// Without the resource an unscoped row is unattributable; the age is
+	// next; the worktree costs the least to lose, so it goes last.
+	if !(res < age && age < proj) {
+		t.Fatalf("suffix order = resource %d, age %d, worktree %d:\n%s", res, age, proj, full)
+	}
+	// At 80 columns the worktree is what the truncation takes, while the
+	// outcome and resource stay.
+	narrow := plainText(fitFrame(completionLines(cs, testNow, true, true), 80, 24))
+	if !strings.Contains(narrow, "exit 9") || !strings.Contains(narrow, "gpu") {
+		t.Errorf("the outcome and resource must survive an 80-column frame:\n%s", narrow)
+	}
+	if strings.Contains(narrow, "proj [main]") {
+		t.Errorf("the worktree should have been the part dropped:\n%s", narrow)
+	}
+}
+
+func TestCompletionLinesOmitResourceWhenScoped(t *testing.T) {
+	cs := []queue.Completion{testCompletion("aaa", "gpu", "Build", queue.OutcomeOK, 0, 1000, 0)}
+	if got := plainText(completionLines(cs, testNow, true, false)); strings.Contains(got, "gpu") {
+		t.Errorf("a scoped view should not repeat the resource on every row:\n%s", got)
+	}
+	if got := plainText(completionLines(cs, testNow, true, true)); !strings.Contains(got, "gpu") {
+		t.Errorf("an unscoped view needs the resource to attribute a row:\n%s", got)
+	}
+}
+
+func TestCompletionLinesNonCompactUsesContinuationLines(t *testing.T) {
+	got := plainTexts(completionLines([]queue.Completion{
+		testCompletion("aaa", "gpu", "Build", queue.OutcomeOK, 0, 1000, 0),
+	}, testNow, false, false))
+	if len(got) != 4 {
+		t.Fatalf("expected blank, heading, entry and continuation; got %d lines: %q", len(got), got)
+	}
+	if !strings.HasPrefix(got[3], entryIndent+"project: ") {
+		t.Errorf("continuation line = %q, want the project under the label", got[3])
+	}
+	// The status layout must not leave trailing whitespace on the entry.
+	if strings.TrimRight(got[2], " ") != got[2] {
+		t.Errorf("entry line has trailing whitespace: %q", got[2])
+	}
+}
+
+// TestCompletionLinesReportAnEmptyRing covers the difference between the two
+// callers: status was asked for the section by name, so it gets an answer.
+func TestCompletionLinesReportAnEmptyRing(t *testing.T) {
+	got := plainText(completionLines(nil, testNow, false, false))
+	if !strings.Contains(got, completionsHeading) || !strings.Contains(got, "(none recorded)") {
+		t.Errorf("an empty ring should still answer:\n%s", got)
+	}
+}
+
+// TestMonitorBodyShowsCompletionsWithAnEmptyQueue guards the case the section
+// is most useful in: nothing is running, and the question is what finished.
+func TestMonitorBodyShowsCompletionsWithAnEmptyQueue(t *testing.T) {
+	done := []queue.Completion{testCompletion("aaa", "gpu", "Build", queue.OutcomeOK, 0, 1000, 0)}
+	got := plainText(monitorBody(nil, done, "", testNow))
+	if !strings.Contains(got, "No active workgate workloads.") {
+		t.Errorf("the empty-queue message should remain:\n%s", got)
+	}
+	if !strings.Contains(got, completionsHeading) || !strings.Contains(got, "Build") {
+		t.Errorf("completions should survive an empty queue:\n%s", got)
+	}
+}
+
+func TestMonitorBodyOmitsTheSectionWhenThereAreNoCompletions(t *testing.T) {
+	got := plainTexts(monitorBody([]queue.Workload{
+		testWorkload("aaa", "gpu", "Holder", "running", 5000, 0),
+	}, nil, "gpu", testNow))
+	for _, l := range got {
+		if strings.Contains(l, completionsHeading) {
+			t.Fatalf("the monitor was not asked for the section by name:\n%s", strings.Join(got, "\n"))
+		}
+	}
+	if last := got[len(got)-1]; strings.TrimSpace(last) == "" {
+		t.Errorf("a stray separator was left behind:\n%s", strings.Join(got, "\n"))
+	}
+}
+
+func TestFmtAgo(t *testing.T) {
+	tests := []struct {
+		d    time.Duration
+		want string
+	}{
+		{0, "(just now)"},
+		{59 * time.Second, "(just now)"},
+		{90 * time.Second, "(1m ago)"},
+		{59 * time.Minute, "(59m ago)"},
+		{3 * time.Hour, "(3h ago)"},
+		// The day rollover is why fmtElapsed cannot serve here: it would
+		// render this as 25:00:00.
+		{25 * time.Hour, "(1d ago)"},
+	}
+	for _, tc := range tests {
+		if got := fmtAgo(tc.d); got != tc.want {
+			t.Errorf("fmtAgo(%s) = %q, want %q", tc.d, got, tc.want)
+		}
+	}
+}
+
+func TestParseStatusArgs(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		resource string
+		recent   int
+		wantErr  bool
+	}{
+		{name: "no arguments"},
+		{name: "resource only", args: []string{"gpu"}, resource: "gpu"},
+		{name: "bare flag", args: []string{"--recent"}, recent: defaultRecentCount},
+		{name: "flag and resource", args: []string{"gpu", "--recent"},
+			resource: "gpu", recent: defaultRecentCount},
+		{name: "joined count", args: []string{"--recent=5", "gpu"}, resource: "gpu", recent: 5},
+		{name: "count at the cap", args: []string{"--recent=10"}, recent: 10},
+		// A bare number would otherwise be taken as a resource name, since
+		// "5" is a valid one; say so rather than doing the wrong thing.
+		{name: "separate count", args: []string{"--recent", "5"}, wantErr: true},
+		{name: "zero count", args: []string{"--recent=0"}, wantErr: true},
+		{name: "count beyond what is retained", args: []string{"--recent=99"}, wantErr: true},
+		{name: "unparseable count", args: []string{"--recent=lots"}, wantErr: true},
+		{name: "unknown flag", args: []string{"--verbose"}, wantErr: true},
+		{name: "second positional", args: []string{"gpu", "rig"}, wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resource, recent, err := parseStatusArgs(tc.args)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected an error, got resource=%q recent=%d", resource, recent)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if resource != tc.resource || recent != tc.recent {
+				t.Errorf("= (%q, %d), want (%q, %d)", resource, recent, tc.resource, tc.recent)
+			}
+		})
+	}
+}
+
+// TestCompletionsAreDroppedBeforeTheLiveQueue pins the priority a short
+// window imposes. The section is last on screen, so fitFrame eats it first —
+// which is the right way round: the live queue is what the tool is for.
+func TestCompletionsAreDroppedBeforeTheLiveQueue(t *testing.T) {
+	ws := []queue.Workload{
+		testWorkload("aaa", "gpu", "Holder", "running", 5000, 0),
+		testWorkload("bbb", "gpu", "Waiter", "waiting", 2000, 0),
+	}
+	done := []queue.Completion{
+		testCompletion("ccc", "gpu", "Finished", queue.OutcomeOK, 0, 1000, 0),
+	}
+	body := monitorBody(ws, done, "gpu", testNow)
+	if !strings.Contains(plainText(body), "Finished") {
+		t.Fatalf("the section should be present before fitting:\n%s", plainText(body))
+	}
+	// One line short of the whole body: the overflow counter replaces the
+	// last line, which belongs to the completions.
+	got := plainText(fitFrame(body, 80, len(body)-1))
+	for _, want := range []string{"Holder", "Waiter"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the live queue must survive height pressure, missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "Finished") {
+		t.Errorf("the completion should have been the line dropped:\n%s", got)
+	}
+	if !strings.Contains(got, "more (enlarge the window") {
+		t.Errorf("what did not fit should be counted, not silently dropped:\n%s", got)
 	}
 }

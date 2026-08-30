@@ -89,6 +89,34 @@ CREATE INDEX IF NOT EXISTS idx_workloads_resource_seq ON workloads(resource, seq
 -- Hard correctness backstop: SQLite itself refuses a second 'running' row
 -- for the same resource, independent of application logic.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_running ON workloads(resource) WHERE state = 'running';
+
+-- A small bounded ring of recently finished workloads. This is not history:
+-- it is capped per resource and by age (see queue.CompletionsPerResource and
+-- queue.CompletionRetention), and exists only so "monitor" and
+-- "status --recent" can answer "what just finished?". Nothing here affects
+-- locking; no code reads it to make a decision.
+--
+-- id is deliberately NOT UNIQUE: workloads.id is three random bytes, unique
+-- only among live rows, so a cosmetic collision here would fail the release
+-- transaction and strand a resource until the stale threshold.
+CREATE TABLE IF NOT EXISTS completions (
+	seq               INTEGER PRIMARY KEY AUTOINCREMENT,
+	id                TEXT NOT NULL,
+	resource          TEXT NOT NULL,
+	label             TEXT,
+	outcome           TEXT NOT NULL,
+	exit_code         INTEGER NOT NULL DEFAULT 0,
+	started_at        INTEGER NOT NULL,
+	finished_at       INTEGER NOT NULL,
+	working_directory TEXT,
+	repository_root   TEXT,
+	git_branch        TEXT
+);
+-- Ordering is by seq everywhere, for display and for pruning alike: seq is
+-- the real completion order, where finished_at is wall clock and can jump.
+-- finished_at is indexed by nothing because the age sweep is a full scan,
+-- which is only acceptable while the per-resource count cap bounds the table.
+CREATE INDEX IF NOT EXISTS idx_completions_resource_seq ON completions(resource, seq);
 `
 
 func migrate(d *sql.DB) error {

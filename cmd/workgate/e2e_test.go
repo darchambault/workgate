@@ -367,6 +367,13 @@ func TestStaleWorkloadRecoveryAfterHardKill(t *testing.T) {
 	if ws := listState(t, d, "stale-res"); len(ws) != 0 {
 		t.Fatalf("workloads remain: %+v", ws)
 	}
+	// The doomed workload never got to release itself, so B reclaiming it is
+	// the only chance to record what happened to it.
+	text := runStatus(t, dir, env, "stale-res", "--recent")
+	if !strings.Contains(text, "LAST COMPLETED") || !strings.Contains(text, "stale") ||
+		!strings.Contains(text, "doomed") {
+		t.Errorf("the hard-killed workload left no trace:\n%s", text)
+	}
 }
 
 func TestInvalidResourceRejected(t *testing.T) {
@@ -474,6 +481,108 @@ func TestMonitorRejectsBadArguments(t *testing.T) {
 		{"monitor", "not a resource"},
 		{"monitor", "--interval", "10ms"},
 		{"monitor", "--nope"},
+	} {
+		cmd := exec.Command(workgateExe, args...)
+		cmd.Env = append(os.Environ(), env...)
+		out, err := cmd.CombinedOutput()
+		var ee *exec.ExitError
+		if !isExitError(err, &ee) || ee.ExitCode() != 2 {
+			t.Errorf("%v: exit = %v, want usage error 2\n%s", args, err, out)
+		}
+	}
+}
+
+// runStatus runs `status` with the given extra arguments and returns its
+// combined output.
+func runStatus(t *testing.T, dir string, env []string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command(workgateExe, append([]string{"status"}, args...)...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), env...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("status %v: %v\n%s", args, err, out)
+	}
+	return string(out)
+}
+
+// TestStatusShowsRecentCompletions covers the whole path a finished workload
+// takes: run to a non-zero exit, then read it back out of the ring.
+func TestStatusShowsRecentCompletions(t *testing.T) {
+	dir := t.TempDir()
+	env := fastEnv(filepath.Join(dir, "wg.db"))
+
+	a := startWG(t, dir, env, "run", "recent-res", "--label", "First workload", "--",
+		helperExe, "-exit", "0")
+	if code := a.waitExit(t, 30*time.Second); code != 0 {
+		t.Fatalf("A exit = %d, want 0\noutput:\n%s", code, a.output())
+	}
+	b := startWG(t, dir, env, "run", "recent-res", "--label", "Second workload", "--",
+		helperExe, "-exit", "3")
+	if code := b.waitExit(t, 30*time.Second); code != 3 {
+		t.Fatalf("B exit = %d, want 3\noutput:\n%s", code, b.output())
+	}
+
+	text := runStatus(t, dir, env, "recent-res", "--recent")
+	for _, want := range []string{"LAST COMPLETED", "exit 3", "Second workload",
+		"First workload", "(just now)", "ok"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("status --recent output missing %q:\n%s", want, text)
+		}
+	}
+	// Newest first.
+	if strings.Index(text, "Second workload") > strings.Index(text, "First workload") {
+		t.Errorf("completions are not newest-first:\n%s", text)
+	}
+	// --recent=1 must honour the count.
+	if one := runStatus(t, dir, env, "recent-res", "--recent=1"); strings.Contains(one, "First workload") {
+		t.Errorf("--recent=1 showed more than one completion:\n%s", one)
+	}
+	// Without the flag, status output is exactly what it always was.
+	if plain := runStatus(t, dir, env, "recent-res"); strings.Contains(plain, "LAST COMPLETED") {
+		t.Errorf("plain status should not show the section:\n%s", plain)
+	}
+}
+
+// TestMonitorShowsRecentCompletions checks the section reaches the redirected
+// monitor path, which is the one covered automatically.
+func TestMonitorShowsRecentCompletions(t *testing.T) {
+	dir := t.TempDir()
+	env := fastEnv(filepath.Join(dir, "wg.db"))
+
+	a := startWG(t, dir, env, "run", "mon-recent", "--label", "Finished workload", "--",
+		helperExe, "-exit", "0")
+	if code := a.waitExit(t, 30*time.Second); code != 0 {
+		t.Fatalf("A exit = %d, want 0\noutput:\n%s", code, a.output())
+	}
+
+	m := startWG(t, dir, env, "monitor", "mon-recent", "--interval", "200ms")
+	waitFor(t, 15*time.Second, "two monitor frames", func() bool {
+		return strings.Count(m.output(), "workgate monitor - mon-recent") >= 2
+	})
+	text := m.output()
+	for _, want := range []string{"LAST COMPLETED", "Finished workload", "ok",
+		"No active workloads for"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("monitor output missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "\x1b[") {
+		t.Errorf("monitor emitted escape sequences to a pipe:\n%q", text)
+	}
+	m.cmd.Process.Kill()
+}
+
+// TestStatusRejectsBadArguments mirrors TestMonitorRejectsBadArguments. These
+// used to be accepted silently, status having had no argument parser at all.
+func TestStatusRejectsBadArguments(t *testing.T) {
+	env := fastEnv(filepath.Join(t.TempDir(), "wg.db"))
+	for _, args := range [][]string{
+		{"status", "not a resource"},
+		{"status", "gpu", "rig"},
+		{"status", "--nope"},
+		{"status", "--recent=0"},
+		{"status", "--recent", "5"},
 	} {
 		cmd := exec.Command(workgateExe, args...)
 		cmd.Env = append(os.Environ(), env...)

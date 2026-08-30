@@ -88,14 +88,14 @@ func TestStrictFIFOOrder(t *testing.T) {
 	mustNotAcquire(t, d, b)
 	mustNotAcquire(t, d, c)
 
-	if err := Release(d, a); err != nil {
+	if err := Release(d, a, Outcome{Kind: OutcomeOK}); err != nil {
 		t.Fatal(err)
 	}
 	mustNotAcquire(t, d, c) // newer workload must not overtake b
 	mustAcquire(t, d, b)
 	mustNotAcquire(t, d, c)
 
-	if err := Release(d, b); err != nil {
+	if err := Release(d, b, Outcome{Kind: OutcomeOK}); err != nil {
 		t.Fatal(err)
 	}
 	mustAcquire(t, d, c)
@@ -108,7 +108,7 @@ func TestNewerCannotOvertakeHealthyWaiter(t *testing.T) {
 	b := enqueue(t, d, "unity")
 	c := enqueue(t, d, "unity")
 
-	if err := Release(d, a); err != nil {
+	if err := Release(d, a, Outcome{Kind: OutcomeOK}); err != nil {
 		t.Fatal(err)
 	}
 	// Resource is free; c polls first but must still lose to healthy b.
@@ -130,7 +130,7 @@ func TestReleaseAllowsNextWaiter(t *testing.T) {
 	mustAcquire(t, d, a)
 	b := enqueue(t, d, "unity")
 	mustNotAcquire(t, d, b)
-	if err := Release(d, a); err != nil {
+	if err := Release(d, a, Outcome{Kind: OutcomeOK}); err != nil {
 		t.Fatal(err)
 	}
 	mustAcquire(t, d, b)
@@ -144,7 +144,7 @@ func TestStaleWaitingWorkloadIsRemoved(t *testing.T) {
 	c := enqueue(t, d, "unity")
 	backdateHeartbeat(t, d, b, StaleThreshold+time.Minute)
 
-	if err := Release(d, a); err != nil {
+	if err := Release(d, a, Outcome{Kind: OutcomeOK}); err != nil {
 		t.Fatal(err)
 	}
 	ok, removed, err := TryAcquire(d, c)
@@ -329,7 +329,7 @@ func TestPositionCountsEarlierWorkloads(t *testing.T) {
 func TestHeartbeatOnRemovedRowReturnsErrGone(t *testing.T) {
 	d, _ := testDB(t)
 	a := enqueue(t, d, "unity")
-	if err := Release(d, a); err != nil {
+	if err := Release(d, a, Outcome{Kind: OutcomeOK}); err != nil {
 		t.Fatal(err)
 	}
 	if err := Heartbeat(d, a); err != ErrGone {
@@ -340,10 +340,252 @@ func TestHeartbeatOnRemovedRowReturnsErrGone(t *testing.T) {
 func TestReleaseIsIdempotent(t *testing.T) {
 	d, _ := testDB(t)
 	a := enqueue(t, d, "unity")
-	if err := Release(d, a); err != nil {
+	if err := Release(d, a, Outcome{Kind: OutcomeOK}); err != nil {
 		t.Fatal(err)
 	}
-	if err := Release(d, a); err != nil {
+	if err := Release(d, a, Outcome{Kind: OutcomeOK}); err != nil {
 		t.Fatalf("second release: %v", err)
+	}
+}
+
+// completions reads the whole ring, oldest first, for readable assertions.
+func completions(t *testing.T, d *sql.DB) []Completion {
+	t.Helper()
+	all, err := RecentCompletions(d, "", 1000)
+	if err != nil {
+		t.Fatalf("reading completions: %v", err)
+	}
+	for i, j := 0, len(all)-1; i < j; i, j = i+1, j-1 {
+		all[i], all[j] = all[j], all[i]
+	}
+	return all
+}
+
+func TestReleaseRecordsCompletion(t *testing.T) {
+	d, _ := testDB(t)
+	w, err := Enqueue(d, "gpu", Meta{
+		Label: "build wheels", PID: 4321,
+		WorkingDirectory: "/src/proj", RepositoryRoot: "/src/proj", GitBranch: "feature-x",
+	})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	mustAcquire(t, d, w)
+	time.Sleep(20 * time.Millisecond)
+	if err := Release(d, w, Outcome{Kind: OutcomeExit, ExitCode: 7}); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	got := completions(t, d)
+	if len(got) != 1 {
+		t.Fatalf("completion count = %d, want 1", len(got))
+	}
+	c := got[0]
+	if c.ID != w.ID || c.Resource != "gpu" || c.Label != "build wheels" {
+		t.Errorf("identity = %s/%s/%q, want %s/gpu/build wheels", c.ID, c.Resource, c.Label, w.ID)
+	}
+	if c.Outcome != OutcomeExit || c.ExitCode != 7 {
+		t.Errorf("outcome = %s/%d, want exit/7", c.Outcome, c.ExitCode)
+	}
+	// The paths and branch must come from the deleted row: Enqueue does not
+	// populate them on the in-memory Workload, so a completion built from
+	// that value would silently record an empty context.
+	if c.RepositoryRoot != "/src/proj" || c.WorkingDirectory != "/src/proj" || c.GitBranch != "feature-x" {
+		t.Errorf("context = %q/%q/%q, want /src/proj, /src/proj, feature-x",
+			c.RepositoryRoot, c.WorkingDirectory, c.GitBranch)
+	}
+	if c.StartedAt != w.AcquiredAt {
+		t.Errorf("started_at = %d, want the acquisition time %d", c.StartedAt, w.AcquiredAt)
+	}
+	if held := c.FinishedAt - c.StartedAt; held < 10 || held > 5000 {
+		t.Errorf("held duration = %dms, want roughly the 20ms the workload ran", held)
+	}
+	var live int
+	if err := d.QueryRow(`SELECT COUNT(*) FROM workloads`).Scan(&live); err != nil {
+		t.Fatal(err)
+	}
+	if live != 0 {
+		t.Errorf("workload rows after release = %d, want 0", live)
+	}
+}
+
+func TestReleaseDoesNotRecordAWorkloadThatNeverAcquired(t *testing.T) {
+	d, _ := testDB(t)
+	a := enqueue(t, d, "gpu")
+	mustAcquire(t, d, a)
+	b := enqueue(t, d, "gpu") // queued behind a, never runs
+	if err := Release(d, b, Outcome{Kind: OutcomeCanceled}); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if got := completions(t, d); len(got) != 0 {
+		t.Fatalf("completion count = %d, want 0: a workload that never ran is not a completion", len(got))
+	}
+}
+
+// TestReleaseRecordsAtMostOnce covers the double-call-safe release path in
+// cmdRun: DELETE ... RETURNING finds no row the second time, so there is
+// nothing left to record.
+func TestReleaseRecordsAtMostOnce(t *testing.T) {
+	d, _ := testDB(t)
+	a := enqueue(t, d, "gpu")
+	mustAcquire(t, d, a)
+	for i := 0; i < 2; i++ {
+		if err := Release(d, a, Outcome{Kind: OutcomeOK}); err != nil {
+			t.Fatalf("release #%d: %v", i+1, err)
+		}
+	}
+	if got := completions(t, d); len(got) != 1 {
+		t.Fatalf("completion count = %d, want 1", len(got))
+	}
+}
+
+func TestStaleRunningWorkloadIsRecordedAsStale(t *testing.T) {
+	d, _ := testDB(t)
+	a := enqueue(t, d, "gpu")
+	mustAcquire(t, d, a)
+	backdateHeartbeat(t, d, a, 2*StaleThreshold)
+	if _, err := CleanupStale(d, ""); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	got := completions(t, d)
+	if len(got) != 1 {
+		t.Fatalf("completion count = %d, want 1: a hard-killed workload should leave a trace", len(got))
+	}
+	if got[0].Outcome != OutcomeStale || got[0].ID != a.ID {
+		t.Errorf("completion = %s/%s, want %s/stale", got[0].ID, got[0].Outcome, a.ID)
+	}
+}
+
+func TestStaleWaitingWorkloadIsNotRecorded(t *testing.T) {
+	d, _ := testDB(t)
+	a := enqueue(t, d, "gpu")
+	mustAcquire(t, d, a)
+	b := enqueue(t, d, "gpu")
+	backdateHeartbeat(t, d, b, 2*StaleThreshold)
+	if _, err := CleanupStale(d, ""); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if got := completions(t, d); len(got) != 0 {
+		t.Fatalf("completion count = %d, want 0: a stale waiter never ran", len(got))
+	}
+}
+
+// TestStaleRecordingHappensInsideTryAcquire covers the path that matters for
+// cost: stale cleanup also runs inside the acquisition transaction.
+func TestStaleRecordingHappensInsideTryAcquire(t *testing.T) {
+	d, _ := testDB(t)
+	doomed := enqueue(t, d, "gpu")
+	mustAcquire(t, d, doomed)
+	backdateHeartbeat(t, d, doomed, 2*StaleThreshold)
+
+	next := enqueue(t, d, "gpu")
+	mustAcquire(t, d, next) // reclaims the abandoned row on the way in
+	got := completions(t, d)
+	if len(got) != 1 || got[0].ID != doomed.ID || got[0].Outcome != OutcomeStale {
+		t.Fatalf("completions = %+v, want one stale entry for %s", got, doomed.ID)
+	}
+}
+
+func TestCompletionsRingIsBoundedPerResource(t *testing.T) {
+	d, _ := testDB(t)
+	// A quiet resource, written first: a busy one must not evict it.
+	quiet := enqueue(t, d, "steam-upload")
+	mustAcquire(t, d, quiet)
+	if err := Release(d, quiet, Outcome{Kind: OutcomeOK}); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	var ids []string
+	for i := 0; i < 2*CompletionsPerResource; i++ {
+		w := enqueue(t, d, "gpu")
+		mustAcquire(t, d, w)
+		if err := Release(d, w, Outcome{Kind: OutcomeOK}); err != nil {
+			t.Fatalf("release #%d: %v", i, err)
+		}
+		ids = append(ids, w.ID)
+	}
+
+	gpu, err := RecentCompletions(d, "gpu", 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gpu) != CompletionsPerResource {
+		t.Fatalf("gpu completions = %d, want the cap of %d", len(gpu), CompletionsPerResource)
+	}
+	// Newest first, and the newest are the ones kept.
+	for i, c := range gpu {
+		if want := ids[len(ids)-1-i]; c.ID != want {
+			t.Fatalf("gpu completion %d = %s, want %s (newest first, oldest evicted)", i, c.ID, want)
+		}
+	}
+	other, err := RecentCompletions(d, "steam-upload", 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(other) != 1 {
+		t.Fatalf("steam-upload completions = %d, want 1: the count cap is per resource", len(other))
+	}
+}
+
+func TestCompletionsAgeCapDropsOldRows(t *testing.T) {
+	d, _ := testDB(t)
+	old := enqueue(t, d, "gpu")
+	mustAcquire(t, d, old)
+	if err := Release(d, old, Outcome{Kind: OutcomeOK}); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if _, err := d.Exec(`UPDATE completions SET finished_at = ?`,
+		time.Now().Add(-2*CompletionRetention).UnixMilli()); err != nil {
+		t.Fatalf("ageing the row: %v", err)
+	}
+	// The sweep runs when the next completion is written, on any resource.
+	fresh := enqueue(t, d, "rig")
+	mustAcquire(t, d, fresh)
+	if err := Release(d, fresh, Outcome{Kind: OutcomeOK}); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	got := completions(t, d)
+	if len(got) != 1 || got[0].ID != fresh.ID {
+		t.Fatalf("completions = %+v, want only the fresh %s", got, fresh.ID)
+	}
+}
+
+func TestRecentCompletionsOrderAndScope(t *testing.T) {
+	d, _ := testDB(t)
+	var gpu []string
+	for _, res := range []string{"gpu", "rig", "gpu", "gpu"} {
+		w := enqueue(t, d, res)
+		mustAcquire(t, d, w)
+		if err := Release(d, w, Outcome{Kind: OutcomeOK}); err != nil {
+			t.Fatalf("release: %v", err)
+		}
+		if res == "gpu" {
+			gpu = append(gpu, w.ID)
+		}
+	}
+	all, err := RecentCompletions(d, "", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("limit not honoured: got %d rows, want 2", len(all))
+	}
+	if all[0].ID != gpu[len(gpu)-1] {
+		t.Errorf("first row = %s, want the newest completion %s", all[0].ID, gpu[len(gpu)-1])
+	}
+	scoped, err := RecentCompletions(d, "gpu", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scoped) != len(gpu) {
+		t.Fatalf("scoped completions = %d, want %d", len(scoped), len(gpu))
+	}
+	for _, c := range scoped {
+		if c.Resource != "gpu" {
+			t.Errorf("scoped read returned a %q row", c.Resource)
+		}
+	}
+	if n, err := RecentCompletions(d, "", 0); err != nil || n != nil {
+		t.Errorf("RecentCompletions(limit 0) = %v, %v; want nil, nil", n, err)
 	}
 }

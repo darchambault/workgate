@@ -101,6 +101,57 @@ type StaleRemoved struct {
 	State    string
 }
 
+// Outcome describes how a workload's turn ended. It is display-only: no
+// coordination decision reads it.
+type Outcome struct {
+	Kind     string // one of the Outcome* constants
+	ExitCode int    // meaningful only for OutcomeExit
+}
+
+// The outcome vocabulary. Each of these is rendered in a fixed-width column,
+// so the words are kept short deliberately — see outcomeSpan in cmd/workgate,
+// and the test that asserts they fit.
+const (
+	OutcomeOK       = "ok"       // the child exited 0
+	OutcomeExit     = "exit"     // the child exited non-zero
+	OutcomeKilled   = "killed"   // terminated by a signal, or crashed
+	OutcomeCanceled = "canceled" // workgate interrupted while the child ran
+	OutcomeStale    = "stale"    // owner stopped heartbeating; reclaimed
+)
+
+// Completion is one finished workload from the bounded ring. It records what
+// a workload did, never what it may do: nothing in the coordination protocol
+// reads these rows.
+type Completion struct {
+	Seq              int64
+	ID               string
+	Resource         string
+	Label            string
+	Outcome          string
+	ExitCode         int64
+	StartedAt        int64 // unix milliseconds; the workload's acquired_at
+	FinishedAt       int64 // unix milliseconds
+	WorkingDirectory string
+	RepositoryRoot   string
+	GitBranch        string
+}
+
+// Tuning for the completions ring. These are variables so tests can shorten
+// them; unlike the timing constants above they have no WORKGATE_* override,
+// because nothing about coordination depends on them.
+//
+// The two caps are mutually reinforcing. A count cap alone would leave the
+// table proportional to every resource name ever used, typos included; an age
+// cap alone would let a busy resource evict a quiet one entirely, which is
+// exactly the scoped view the ring is most wanted for. Together they bound
+// the table to CompletionsPerResource × (resources used within the retention
+// window) — dozens of rows, which is what makes the unindexed age sweep in
+// recordCompletionTx acceptable.
+var (
+	CompletionsPerResource = 10
+	CompletionRetention    = 24 * time.Hour
+)
+
 var resourceRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
 
 // ErrGone reports that this workload's row no longer exists — another
@@ -269,12 +320,140 @@ func Heartbeat(d *sql.DB, w *Workload) error {
 }
 
 // Release deletes w's row, letting the next queued workload acquire the
-// resource. Deleting an already-removed row is not an error.
-func Release(d *sql.DB, w *Workload) error {
-	if _, err := d.Exec(`DELETE FROM workloads WHERE id = ?`, w.ID); err != nil {
+// resource, and — if w actually held the resource — records how it ended in
+// the bounded completions ring. Deleting an already-removed row is not an error.
+//
+// Both happen in one short transaction. Splitting them would force a bad
+// choice: deleting first can lose a completion (harmless), but inserting
+// first can leave the resource held if this process dies in between
+// (catastrophic). One transaction removes the choice, and with
+// MaxOpenConns(1) it also avoids taking the write lock twice while a waiter
+// polls.
+//
+// DELETE ... RETURNING does three jobs at once here: it frees the resource,
+// it supplies the label and paths — which the in-memory Workload does not
+// carry, since Enqueue only populates the fields it knows — and its
+// row-or-no-row result is an exactly-once guard, so a caller that releases
+// twice can never write two completions.
+func Release(d *sql.DB, w *Workload, out Outcome) error {
+	tx, err := d.Begin()
+	if err != nil {
+		return fmt.Errorf("beginning release transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	var (
+		label, wd, root, branch string
+		acquiredAt              sql.NullInt64
+	)
+	// QueryRow, not Query: with a single connection, executing the INSERT
+	// below while a RETURNING result set is still open would deadlock.
+	err = tx.QueryRow(`
+		DELETE FROM workloads WHERE id = ?
+		RETURNING IFNULL(label,''), acquired_at, IFNULL(working_directory,''),
+		          IFNULL(repository_root,''), IFNULL(git_branch,'')`, w.ID).
+		Scan(&label, &acquiredAt, &wd, &root, &branch)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		// Another process already reclaimed the row as stale, and recorded
+		// it. Nothing left to do.
+		return commitRelease(tx)
+	case err != nil:
 		return fmt.Errorf("releasing workload: %w", err)
 	}
+	// A workload that never acquired the resource did not run, so it is not
+	// a completion — it would only be noise in a view of the last few.
+	if !acquiredAt.Valid || acquiredAt.Int64 == 0 {
+		return commitRelease(tx)
+	}
+	now := nowMillis()
+	if err := recordCompletionTx(tx, Completion{
+		ID: w.ID, Resource: w.Resource, Label: label,
+		Outcome: out.Kind, ExitCode: int64(out.ExitCode),
+		StartedAt: acquiredAt.Int64, FinishedAt: now,
+		WorkingDirectory: wd, RepositoryRoot: root, GitBranch: branch,
+	}, now); err != nil {
+		return err
+	}
+	return commitRelease(tx)
+}
+
+func commitRelease(tx *sql.Tx) error {
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing release: %w", err)
+	}
 	return nil
+}
+
+// recordCompletionTx appends c to the ring and applies both caps, inside the
+// caller's transaction. It runs once per finished workload — against
+// heartbeats every few seconds and acquisition polls under a second, the two
+// pruning statements are not a hot path.
+func recordCompletionTx(tx *sql.Tx, c Completion, now int64) error {
+	if _, err := tx.Exec(`
+		INSERT INTO completions
+			(id, resource, label, outcome, exit_code, started_at, finished_at,
+			 working_directory, repository_root, git_branch)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.ID, c.Resource, c.Label, c.Outcome, c.ExitCode, c.StartedAt, c.FinishedAt,
+		c.WorkingDirectory, c.RepositoryRoot, c.GitBranch); err != nil {
+		return fmt.Errorf("recording completion: %w", err)
+	}
+	// Count cap, scoped to the resource just written. The subselect yields
+	// NULL when fewer than the cap plus one rows exist, and "seq <= NULL"
+	// matches nothing, so the common case deletes nothing without a COUNT.
+	if _, err := tx.Exec(`
+		DELETE FROM completions
+		WHERE resource = ? AND seq <= (
+			SELECT seq FROM completions WHERE resource = ?
+			ORDER BY seq DESC LIMIT 1 OFFSET ?)`,
+		c.Resource, c.Resource, CompletionsPerResource); err != nil {
+		return fmt.Errorf("trimming completions for %q: %w", c.Resource, err)
+	}
+	// Age cap, global: sweeps out resources that stopped being used at all,
+	// which the per-resource count cap cannot reach.
+	if _, err := tx.Exec(`DELETE FROM completions WHERE finished_at < ?`,
+		now-CompletionRetention.Milliseconds()); err != nil {
+		return fmt.Errorf("expiring completions: %w", err)
+	}
+	return nil
+}
+
+// RecentCompletions returns the most recently finished workloads (all
+// resources if resource is empty), newest first. Ordering is by seq rather
+// than by finished_at for the same reason the queue is: seq is the real
+// order, where wall clock can jump.
+func RecentCompletions(d *sql.DB, resource string, limit int) ([]Completion, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	q := `SELECT seq, id, resource, IFNULL(label,''), outcome, exit_code,
+	             started_at, finished_at, IFNULL(working_directory,''),
+	             IFNULL(repository_root,''), IFNULL(git_branch,'')
+	      FROM completions`
+	var args []any
+	if resource != "" {
+		q += ` WHERE resource = ?`
+		args = append(args, resource)
+	}
+	q += ` ORDER BY seq DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := d.Query(q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("listing completions: %w", err)
+	}
+	defer rows.Close()
+	var out []Completion
+	for rows.Next() {
+		var c Completion
+		if err := rows.Scan(&c.Seq, &c.ID, &c.Resource, &c.Label, &c.Outcome,
+			&c.ExitCode, &c.StartedAt, &c.FinishedAt,
+			&c.WorkingDirectory, &c.RepositoryRoot, &c.GitBranch); err != nil {
+			return nil, fmt.Errorf("reading completion row: %w", err)
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 // CleanupStale removes abandoned workloads (any resource if resource is
@@ -292,28 +471,65 @@ func CleanupStale(d *sql.DB, resource string) ([]StaleRemoved, error) {
 	return removed, tx.Commit()
 }
 
+// deleteStaleTx removes abandoned rows and records the ones that held the
+// resource as OutcomeStale, so a hard-killed workload leaves a trace instead
+// of simply vanishing. Stale *waiting* rows never ran and are not recorded,
+// the same rule Release applies.
+//
+// This runs inside TryAcquire's acquisition transaction, so the extra work
+// matters. It is bounded to at most one insert-and-prune per resource: only
+// running rows are recorded, and idx_one_running guarantees there is at most
+// one of those per resource.
 func deleteStaleTx(tx *sql.Tx, resource string, now int64) ([]StaleRemoved, error) {
+	removed, reclaimed, err := takeStaleTx(tx, resource, now)
+	if err != nil {
+		return nil, err
+	}
+	// Recorded only after takeStaleTx has closed its result set: with a
+	// single connection, inserting while RETURNING rows are still open would
+	// deadlock.
+	for _, c := range reclaimed {
+		if err := recordCompletionTx(tx, c, now); err != nil {
+			return nil, err
+		}
+	}
+	return removed, nil
+}
+
+// takeStaleTx deletes the abandoned rows and splits them into what the caller
+// reports and what is worth recording.
+func takeStaleTx(tx *sql.Tx, resource string, now int64) ([]StaleRemoved, []Completion, error) {
 	cutoff := now - StaleThreshold.Milliseconds()
-	q := `DELETE FROM workloads WHERE heartbeat_at < ? RETURNING id, resource, state`
+	const cols = ` RETURNING id, resource, state, IFNULL(label,''), IFNULL(acquired_at,0),
+	          IFNULL(working_directory,''), IFNULL(repository_root,''),
+	          IFNULL(git_branch,'')`
+	q := `DELETE FROM workloads WHERE heartbeat_at < ?` + cols
 	args := []any{cutoff}
 	if resource != "" {
-		q = `DELETE FROM workloads WHERE resource = ? AND heartbeat_at < ? RETURNING id, resource, state`
+		q = `DELETE FROM workloads WHERE resource = ? AND heartbeat_at < ?` + cols
 		args = []any{resource, cutoff}
 	}
 	rows, err := tx.Query(q, args...)
 	if err != nil {
-		return nil, fmt.Errorf("removing stale workloads: %w", err)
+		return nil, nil, fmt.Errorf("removing stale workloads: %w", err)
 	}
 	defer rows.Close()
 	var removed []StaleRemoved
+	var reclaimed []Completion
 	for rows.Next() {
 		var r StaleRemoved
-		if err := rows.Scan(&r.ID, &r.Resource, &r.State); err != nil {
-			return nil, fmt.Errorf("reading stale workload row: %w", err)
+		var c Completion
+		if err := rows.Scan(&r.ID, &r.Resource, &r.State, &c.Label, &c.StartedAt,
+			&c.WorkingDirectory, &c.RepositoryRoot, &c.GitBranch); err != nil {
+			return nil, nil, fmt.Errorf("reading stale workload row: %w", err)
 		}
 		removed = append(removed, r)
+		if r.State == "running" {
+			c.ID, c.Resource, c.Outcome, c.FinishedAt = r.ID, r.Resource, OutcomeStale, now
+			reclaimed = append(reclaimed, c)
+		}
 	}
-	return removed, rows.Err()
+	return removed, reclaimed, rows.Err()
 }
 
 // List returns current workloads (all resources if resource is empty),

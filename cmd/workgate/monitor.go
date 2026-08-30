@@ -18,6 +18,12 @@ const (
 	// A floor on the refresh rate. Faster than this buys nothing — elapsed
 	// times are shown to the second — and only adds database traffic.
 	minMonitorInterval = 100 * time.Millisecond
+	// How many recent completions the monitor shows. Fixed rather than a
+	// flag: the frame has a fixed height, so a larger number would push the
+	// live queue — the thing the monitor exists for — into the overflow
+	// counter. --interval is a flag because there is no right refresh rate;
+	// three is a fine answer here.
+	monitorRecentCount = 3
 )
 
 // cmdMonitor renders a live view of the queue until interrupted.
@@ -69,8 +75,12 @@ func cmdMonitor(args []string) int {
 	var body []line
 	for {
 		workloads, listErr := queue.List(d, resource)
+		var done []queue.Completion
 		if listErr == nil {
-			body = monitorBody(workloads, resource, time.Now().UnixMilli())
+			done, listErr = queue.RecentCompletions(d, resource, monitorRecentCount)
+		}
+		if listErr == nil {
+			body = monitorBody(workloads, done, resource, time.Now().UnixMilli())
 		}
 		if err := sc.draw(monitorFrame(scope, body, listErr, interval, time.Now())); err != nil {
 			// Almost always a closed pipe (`| head`); nothing to report.
@@ -84,15 +94,26 @@ func cmdMonitor(args []string) int {
 	}
 }
 
-// monitorBody renders the workload block, or the empty-queue message.
-func monitorBody(workloads []queue.Workload, resource string, now int64) []line {
-	if len(workloads) == 0 {
-		if resource != "" {
-			return []line{plainLine(fmt.Sprintf("No active workloads for %q.", resource))}
-		}
-		return []line{plainLine("No active workgate workloads.")}
+// monitorBody renders the workload block, followed by the recent-completions
+// section. The completions are appended even when the queue is empty: "there
+// is nothing running, and here is what just finished" is the question an
+// empty monitor is most often being asked.
+func monitorBody(workloads []queue.Workload, done []queue.Completion, resource string, now int64) []line {
+	var out []line
+	switch {
+	case len(workloads) > 0:
+		out = statusLines(workloads, now, true)
+	case resource != "":
+		out = []line{plainLine(fmt.Sprintf("No active workloads for %q.", resource))}
+	default:
+		out = []line{plainLine("No active workgate workloads.")}
 	}
-	return statusLines(workloads, now, true)
+	// Unlike status --recent, the monitor was not asked for this section by
+	// name, so an empty ring shows nothing rather than "(none recorded)".
+	if len(done) > 0 {
+		out = append(out, completionLines(done, now, true, resource == "")...)
+	}
+	return out
 }
 
 // monitorFrame assembles one frame from the most recent successful read. A
