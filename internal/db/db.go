@@ -4,6 +4,7 @@ package db
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -83,7 +84,14 @@ CREATE TABLE IF NOT EXISTS workloads (
 	git_common_dir    TEXT,
 	git_branch        TEXT,
 	command_display   TEXT,
-	hostname          TEXT
+	hostname          TEXT,
+	-- Declared last so a database created here and one brought up to date
+	-- by migratePriority (which can only append) have the same column
+	-- order. NOT NULL DEFAULT 3 is what makes the column compatible in
+	-- both directions: rows that predate it read as the neutral level,
+	-- and an older workgate binary, whose INSERT does not mention the
+	-- column, still writes a valid row.
+	priority          INTEGER NOT NULL DEFAULT 3 CHECK (priority BETWEEN 1 AND 5)
 );
 CREATE INDEX IF NOT EXISTS idx_workloads_resource_seq ON workloads(resource, seq);
 -- Hard correctness backstop: SQLite itself refuses a second 'running' row
@@ -119,9 +127,71 @@ CREATE TABLE IF NOT EXISTS completions (
 CREATE INDEX IF NOT EXISTS idx_completions_resource_seq ON completions(resource, seq);
 `
 
+// Statements that bring a database created before priorities existed up to
+// date. Neither can live in schema: on such a database the schema Exec runs
+// before the ALTER, so an index over priority would reference a column that is
+// not there yet. The order is fixed - CREATE TABLE, then ALTER, then INDEX.
+const (
+	addPriorityColumn = `ALTER TABLE workloads ADD COLUMN priority INTEGER NOT NULL DEFAULT 3 CHECK (priority BETWEEN 1 AND 5)`
+
+	// Acquisition order is (priority, seq) within a resource; this index says
+	// so. idx_workloads_resource_seq stays, because arrival order is still what
+	// orders a level and what List falls back on.
+	priorityIndex = `CREATE INDEX IF NOT EXISTS idx_workloads_resource_priority_seq ON workloads(resource, priority, seq)`
+)
+
 func migrate(d *sql.DB) error {
 	if _, err := d.Exec(schema); err != nil {
 		return fmt.Errorf("initializing schema: %w", err)
 	}
-	return nil
+	return migratePriority(d)
+}
+
+// migratePriority adds the priority column to a database that predates it.
+// CREATE TABLE IF NOT EXISTS cannot add a column to a table that already
+// exists, so this is the one piece of schema that needs a real migration.
+//
+// Several workgate processes routinely open this database at the same moment,
+// so the check and the ALTER run inside one immediate transaction (the DSN's
+// _txlock=immediate takes the write lock at BEGIN): a second process blocks on
+// that lock and then simply sees the column already there. Re-checking after a
+// failed ALTER keeps this correct even if the DDL ever escaped that lock - the
+// condition that matters is "the column exists", not "my ALTER succeeded", so
+// nothing here depends on matching SQLite's error text.
+func migratePriority(d *sql.DB) error {
+	tx, err := d.Begin()
+	if err != nil {
+		return fmt.Errorf("beginning schema migration: %w", err)
+	}
+	defer tx.Rollback()
+
+	has, err := hasColumn(tx, "workloads", "priority")
+	if err != nil {
+		return err
+	}
+	if !has {
+		if _, alterErr := tx.Exec(addPriorityColumn); alterErr != nil {
+			if has, err = hasColumn(tx, "workloads", "priority"); err != nil {
+				return err
+			} else if !has {
+				return fmt.Errorf("adding the priority column: %w", alterErr)
+			}
+		}
+	}
+	if _, err := tx.Exec(priorityIndex); err != nil {
+		return fmt.Errorf("creating the priority index: %w", err)
+	}
+	return tx.Commit()
+}
+
+func hasColumn(tx *sql.Tx, table, column string) (bool, error) {
+	var one int
+	err := tx.QueryRow(`SELECT 1 FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspecting the %s table: %w", table, err)
+	}
+	return true, nil
 }

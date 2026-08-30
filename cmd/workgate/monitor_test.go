@@ -44,6 +44,7 @@ func testWorkload(id, resource, label, state string, ageMS, heartbeatAgeMS int64
 	w := queue.Workload{
 		ID: id, Resource: resource, Label: label, State: state,
 		PID:         4242,
+		Priority:    queue.PriorityDefault,
 		CreatedAt:   testNow - ageMS,
 		HeartbeatAt: testNow - heartbeatAgeMS,
 	}
@@ -151,7 +152,7 @@ func TestStatusLinesWorktreeFallbacks(t *testing.T) {
 func TestStatusLinesEntryLayoutIsUnchangedBySpans(t *testing.T) {
 	w := testWorkload("aaa", "gpu", "Holder", "running", 5000, 0)
 	lines := plainTexts(statusLines([]queue.Workload{w}, testNow, false))
-	want := fmt.Sprintf("  %-8s %-10s %-8s %s", "aaa", "pid 4242", "00:05", `"Holder"`)
+	want := fmt.Sprintf("  %-8s %-10s %-8s %-2s %s", "aaa", "pid 4242", "00:05", "P3", `"Holder"`)
 	for _, l := range lines {
 		if strings.Contains(l, "Holder") {
 			if l != want {
@@ -488,7 +489,7 @@ func TestCompletionLinesShareTheEntryGrid(t *testing.T) {
 			doneEntry = l
 		}
 	}
-	want := fmt.Sprintf("  %-8s %-10s %-8s %-32s", "bbb", "exit 1", "00:05", `"Finished"`)
+	want := fmt.Sprintf("  %-8s %-10s %-8s %-2s %-32s", "bbb", "exit 1", "00:05", "", `"Finished"`)
 	if !strings.HasPrefix(doneEntry, want) {
 		t.Fatalf("completion entry = %q, want it to start %q", doneEntry, want)
 	}

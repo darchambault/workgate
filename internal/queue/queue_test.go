@@ -24,7 +24,12 @@ func testDB(t *testing.T) (*sql.DB, string) {
 
 func enqueue(t *testing.T, d *sql.DB, resource string) *Workload {
 	t.Helper()
-	w, err := Enqueue(d, resource, Meta{Label: "test", PID: 1234})
+	return enqueueAt(t, d, resource, PriorityDefault)
+}
+
+func enqueueAt(t *testing.T, d *sql.DB, resource string, priority int) *Workload {
+	t.Helper()
+	w, err := Enqueue(d, resource, priority, Meta{Label: "test", PID: 1234})
 	if err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
@@ -101,6 +106,8 @@ func TestStrictFIFOOrder(t *testing.T) {
 	mustAcquire(t, d, c)
 }
 
+// Arrival order is still absolute within a priority level, which is what this
+// and TestStrictFIFOOrder cover: everything here is enqueued at the default.
 func TestNewerCannotOvertakeHealthyWaiter(t *testing.T) {
 	d, _ := testDB(t)
 	a := enqueue(t, d, "unity")
@@ -363,7 +370,7 @@ func completions(t *testing.T, d *sql.DB) []Completion {
 
 func TestReleaseRecordsCompletion(t *testing.T) {
 	d, _ := testDB(t)
-	w, err := Enqueue(d, "gpu", Meta{
+	w, err := Enqueue(d, "gpu", PriorityDefault, Meta{
 		Label: "build wheels", PID: 4321,
 		WorkingDirectory: "/src/proj", RepositoryRoot: "/src/proj", GitBranch: "feature-x",
 	})

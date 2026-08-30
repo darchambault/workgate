@@ -1,9 +1,10 @@
-// Command workgate provides machine-global, named, FIFO-exclusive execution
-// of locally launched workloads:
+// Command workgate provides machine-global, named, exclusive execution of
+// locally launched workloads, ordered by priority and then by arrival:
 //
-//	workgate run <resource> [--label "<text>"] -- <command> [args...]
+//	workgate run <resource> [--label "<text>"] [--priority <1-5>] -- <command> [args...]
 //	workgate status [<resource>]
 //	workgate monitor [<resource>] [--interval <duration>]
+//	workgate priority <id> <1-5>
 package main
 
 import (
@@ -23,16 +24,23 @@ import (
 	"workgate/internal/runner"
 )
 
-const usage = `workgate - machine-global FIFO-exclusive execution of local workloads
+const usage = `workgate - machine-global exclusive execution of local workloads
 
 Usage:
-  workgate run <resource> [--label "<description>"] -- <command> [args...]
+  workgate run <resource> [--label "<description>"] [--priority <1-5>] -- <command> [args...]
   workgate status [<resource>] [--recent[=<count>]]
   workgate monitor [<resource>] [--interval <duration>]
+  workgate priority <id> <1-5>
 
-Workloads targeting the same resource execute one at a time, in strict
-arrival order, across all projects and terminals on this machine. The
-resource is released automatically when the wrapped command exits.
+Workloads targeting the same resource execute one at a time, across all
+projects and terminals on this machine: the highest priority first, and in
+strict arrival order within one priority level. The resource is released
+automatically when the wrapped command exits.
+
+Priority runs from 1 (highest) to 5 (lowest) and defaults to 3. A higher
+priority overtakes workloads that are still waiting, but never interrupts one
+that is already running. "priority" re-prioritizes a workload that is already
+queued, whichever session started it; take the id from "workgate status".
 
 "monitor" is "status" as a live, full-screen view: it redraws once per
 second until interrupted with Ctrl+C, and never modifies the queue.
@@ -60,6 +68,8 @@ func realMain(args []string) int {
 		return cmdStatus(args[1:])
 	case "monitor":
 		return cmdMonitor(args[1:])
+	case "priority":
+		return cmdPriority(args[1:])
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 		return 0
@@ -81,7 +91,7 @@ func fail(err error) int {
 }
 
 func cmdRun(args []string) int {
-	resource, label, argv, err := parseRunArgs(args)
+	resource, label, priorityArg, argv, err := parseRunArgs(args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "workgate: %v\n\n%s", err, usage)
 		return 2
@@ -90,6 +100,13 @@ func cmdRun(args []string) int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "workgate: %v\n", err)
 		return 2
+	}
+	priority := queue.PriorityDefault
+	if priorityArg != "" {
+		if priority, err = queue.ValidatePriority(priorityArg); err != nil {
+			fmt.Fprintf(os.Stderr, "workgate: %v\n", err)
+			return 2
+		}
 	}
 
 	path, err := db.Path()
@@ -118,7 +135,7 @@ func cmdRun(args []string) int {
 		Hostname:         info.Hostname,
 	}
 
-	w, err := queue.Enqueue(d, resource, meta)
+	w, err := queue.Enqueue(d, resource, priority, meta)
 	if err != nil {
 		return fail(err)
 	}
@@ -177,9 +194,9 @@ func cmdRun(args []string) int {
 			pos = 0
 		}
 		if pos > 0 {
-			note("Queued for %q (position %d): %s", resource, pos, label)
+			note("Queued for %q (position %d)%s: %s", resource, pos, atPriority(priority), label)
 		} else {
-			note("Queued for %q: %s", resource, label)
+			note("Queued for %q%s: %s", resource, atPriority(priority), label)
 		}
 		err = queue.Await(ctx, d, w, queue.AwaitEvents{
 			OnStaleRemoved: onStale,
@@ -395,7 +412,8 @@ func statusLines(workloads []queue.Workload, now int64, compact bool) []line {
 			// timer is what the eye is usually after, and it should not
 			// have to scan past a variable-length label to reach it.
 			entry := entryLine(w.ID, pidSpan(w.PID),
-				fmtElapsed(time.Duration(now-since)*time.Millisecond), w.Label, compact)
+				fmtElapsed(time.Duration(now-since)*time.Millisecond), w.Label,
+				w.Priority, compact)
 			if !compact {
 				out = append(out, entry)
 				if p := displayContext(w); p != "" {
@@ -453,7 +471,7 @@ func completionLines(cs []queue.Completion, now int64, compact, showResource boo
 		// unlike a live entry: a completion always has columns after it.
 		entry := entryLine(c.ID, outcomeSpan(c),
 			fmtElapsed(time.Duration(c.FinishedAt-c.StartedAt)*time.Millisecond),
-			c.Label, true)
+			c.Label, 0, true)
 		// Suffix order is truncation order, most important first. Without
 		// the resource an unscoped row is unattributable; the age is next;
 		// the worktree costs the least to lose.
@@ -486,22 +504,35 @@ func completionLines(cs []queue.Completion, now int64, compact, showResource boo
 }
 
 // entryLine builds the entry grid shared by live and finished workloads:
-// "  <id> <col2> <timer> <label>". col2 is the pid for a live workload and
-// the outcome for a finished one — the pid is not merely useless once the
-// process is gone, it is misleading, because pids are recycled. Keeping both
-// row types on one grid is what lets a frame read as a single table.
+// "  <id> <col2> <timer> <priority> <label>". col2 is the pid for a live
+// workload and the outcome for a finished one — the pid is not merely useless
+// once the process is gone, it is misleading, because pids are recycled.
+// Keeping both row types on one grid is what lets a frame read as a single
+// table. priority is 0 for a finished workload, whose level was not recorded
+// and would say nothing about a queue it has already left; the column is still
+// spent, so the grid holds.
+//
+// Priority sits between the timer and the label because it is a fact about the
+// queue, like the timer, and because a narrow terminal truncates from the
+// right: a column that explains why the rows are in this order should not be
+// the first thing lost.
 //
 // Each column is its own span so the id and col2 can carry their own style:
 // they identify a row but are rarely what is wanted. padLabel is for rows
 // with more columns after the label; where the label ends the line, padding
 // it would only leave trailing whitespace.
-func entryLine(id string, col2 span, timer, label string, padLabel bool) line {
+func entryLine(id string, col2 span, timer, label string, priority int, padLabel bool) line {
 	if label == "" {
 		label = "(no label)"
 	}
 	labelText := fmt.Sprintf("%q", label)
 	if padLabel {
-		labelText = fmt.Sprintf("%-*s", labelWidth, labelText)
+		// Clamped, not merely padded. %-*s widens a short label but never
+		// trims a long one, so an unclamped label would push every later
+		// column right by however much a session chose to type — far enough,
+		// on a narrow screen, to truncate away the [STALE] marker that the
+		// row exists to show.
+		labelText = fmt.Sprintf("%-*s", labelWidth, clampWidth(labelText, labelWidth))
 	}
 	return line{
 		{text: "  "},
@@ -509,8 +540,39 @@ func entryLine(id string, col2 span, timer, label string, padLabel bool) line {
 		{text: " "},
 		col2,
 		{text: " " + fmt.Sprintf("%-*s", elapsedWidth, timer)},
+		{text: " "},
+		prioritySpan(priority),
 		{text: " " + labelText},
 	}
+}
+
+// clampWidth trims s to n display columns, rune-aware. truncate cannot serve:
+// it counts bytes, and a label is arbitrary user text.
+func clampWidth(s string, n int) string {
+	return truncateLine(line{{text: s}}, n).plain()
+}
+
+// prioritySpan renders the priority column. It always occupies priorityWidth,
+// so a row without a level — a finished workload, or one written by a binary
+// that predates priorities — keeps the columns after it aligned.
+//
+// The default level is dimmed: it is the answer for most rows and should not
+// compete with the label. The top level is bold rather than red, because red
+// is this palette's word for trouble ([STALE], a failed refresh) and urgent
+// work is not a fault. Colour is a second channel either way — the level is
+// written out.
+func prioritySpan(p int) span {
+	if p < queue.PriorityHighest || p > queue.PriorityLowest {
+		return span{text: strings.Repeat(" ", priorityWidth)}
+	}
+	text := fmt.Sprintf("%-*s", priorityWidth, fmt.Sprintf("P%d", p))
+	switch p {
+	case queue.PriorityHighest:
+		return span{text: text, style: styleBold}
+	case queue.PriorityDefault:
+		return span{text: text, style: styleDim}
+	}
+	return span{text: text}
 }
 
 // outcomeSpan renders the outcome in the column a live row spends on its pid.
@@ -552,13 +614,15 @@ func fmtAgo(d time.Duration) string {
 	}
 }
 
-// Column widths for an entry line: "  <id> <pid-or-outcome> <timer> <label>".
+// Column widths for an entry line:
+// "  <id> <pid-or-outcome> <timer> <priority> <label>".
 const (
-	idWidth      = 8
-	pidWidth     = 10 // "pid " plus a six-digit pid
-	elapsedWidth = 8  // "HH:MM:SS"
-	labelWidth   = 32
-	agoWidth     = 10 // "(just now)", and every age the retention allows
+	idWidth       = 8
+	pidWidth      = 10 // "pid " plus a six-digit pid
+	elapsedWidth  = 8  // "HH:MM:SS"
+	priorityWidth = 2  // "P" plus one level
+	labelWidth    = 32
+	agoWidth      = 10 // "(just now)", and every age the retention allows
 )
 
 // defaultRecentCount is how many completions `status --recent` shows when no
@@ -566,7 +630,8 @@ const (
 const defaultRecentCount = 3
 
 // entryIndent aligns status's project continuation line under the label.
-var entryIndent = strings.Repeat(" ", 2+idWidth+1+pidWidth+1+elapsedWidth+1)
+var entryIndent = strings.Repeat(" ",
+	2+idWidth+1+pidWidth+1+elapsedWidth+1+priorityWidth+1)
 
 // pidSpan renders the pid column, dimmed like the id. A workload that has no
 // pid yet still occupies the column, so the columns after it stay aligned.
@@ -622,9 +687,18 @@ func fmtElapsed(d time.Duration) string {
 	return fmt.Sprintf("%02d:%02d", s/60, s%60)
 }
 
-// parseRunArgs parses: <resource> [--label <text>] -- <command> [args...]
-// Everything after "--" is the child's argv, preserved exactly.
-func parseRunArgs(args []string) (resource, label string, argv []string, err error) {
+// parseRunArgs parses:
+// <resource> [--label <text>] [--priority <1-5>] -- <command> [args...]
+//
+// The priority is returned as written and validated by the caller, exactly as
+// the resource is: this function decides what is a flag, not what is a legal
+// value. Everything after "--" is the child's argv, including a --priority the
+// child itself takes.
+func parseRunArgs(args []string) (resource, label, priority string, argv []string, err error) {
+	// Named results make a five-value error return unreadable at each site.
+	bad := func(err error) (string, string, string, []string, error) {
+		return "", "", "", nil, err
+	}
 	i := 0
 	for i < len(args) {
 		a := args[i]
@@ -632,31 +706,146 @@ func parseRunArgs(args []string) (resource, label string, argv []string, err err
 		case a == "--":
 			argv = args[i+1:]
 			if len(argv) == 0 {
-				return "", "", nil, errors.New("no command given after --")
+				return bad(errors.New("no command given after --"))
 			}
 			if resource == "" {
-				return "", "", nil, errors.New("missing resource name")
+				return bad(errors.New("missing resource name"))
 			}
-			return resource, label, argv, nil
+			return resource, label, priority, argv, nil
 		case a == "--label":
 			if i+1 >= len(args) {
-				return "", "", nil, errors.New("--label requires a value")
+				return bad(errors.New("--label requires a value"))
 			}
 			label = args[i+1]
 			i += 2
 		case strings.HasPrefix(a, "--label="):
 			label = strings.TrimPrefix(a, "--label=")
 			i++
+		case a == "--priority":
+			if i+1 >= len(args) {
+				return bad(errors.New("--priority requires a value"))
+			}
+			priority = args[i+1]
+			i += 2
+		case strings.HasPrefix(a, "--priority="):
+			priority = strings.TrimPrefix(a, "--priority=")
+			i++
 		case strings.HasPrefix(a, "-"):
-			return "", "", nil, fmt.Errorf("unknown flag %q", a)
+			return bad(fmt.Errorf("unknown flag %q", a))
 		case resource == "":
 			resource = a
 			i++
 		default:
-			return "", "", nil, fmt.Errorf("unexpected argument %q (child command must follow --)", a)
+			return bad(fmt.Errorf("unexpected argument %q (child command must follow --)", a))
 		}
 	}
-	return "", "", nil, errors.New("missing -- before the command to run")
+	return bad(errors.New("missing -- before the command to run"))
+}
+
+// parsePriorityArgs parses: <id> <1-5>
+// Both are returned as written; cmdPriority validates them, so a bad id and a
+// bad level produce their own messages rather than one about arity.
+func parsePriorityArgs(args []string) (id, level string, err error) {
+	var positional []string
+	for _, a := range args {
+		if strings.HasPrefix(a, "-") {
+			return "", "", fmt.Errorf("unknown flag %q", a)
+		}
+		positional = append(positional, a)
+	}
+	switch len(positional) {
+	case 0:
+		return "", "", errors.New("missing workload id and priority level")
+	case 1:
+		return "", "", errors.New("missing priority level")
+	case 2:
+		return positional[0], positional[1], nil
+	default:
+		return "", "", fmt.Errorf("unexpected argument %q", positional[2])
+	}
+}
+
+// atPriority names a non-default level for the queued notice. The default is
+// left unsaid: it is what almost every workload runs at, and repeating it on
+// every line would make the one line that matters harder to spot.
+func atPriority(level int) string {
+	if level == queue.PriorityDefault {
+		return ""
+	}
+	return fmt.Sprintf(" at priority %d", level)
+}
+
+// cmdPriority re-prioritizes a workload that is already queued. It is the only
+// command that writes a row another session owns, which is the point: the
+// process that would otherwise change its own mind is blocked inside its own
+// `workgate run`, so someone else has to speak for it.
+//
+// Nothing is signalled. The waiting process re-reads its priority on its next
+// poll, so the change lands within a poll interval on its own.
+func cmdPriority(args []string) int {
+	idArg, levelArg, err := parsePriorityArgs(args)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "workgate: %v\n\n%s", err, usage)
+		return 2
+	}
+	id, err := queue.ValidateID(idArg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "workgate: %v\n", err)
+		return 2
+	}
+	level, err := queue.ValidatePriority(levelArg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "workgate: %v\n", err)
+		return 2
+	}
+
+	path, err := db.Path()
+	if err != nil {
+		return fail(err)
+	}
+	d, err := db.Open(path)
+	if err != nil {
+		return fail(err)
+	}
+	defer d.Close()
+
+	// Like status, and for the same reason: the position reported below would
+	// otherwise count workloads whose owner is already gone.
+	removed, err := queue.CleanupStale(d, "")
+	if err != nil {
+		return fail(err)
+	}
+	for _, r := range removed {
+		note("Removed stale workload %s from %q", r.ID, r.Resource)
+	}
+
+	ch, err := queue.SetPriority(d, id, level)
+	if errors.Is(err, queue.ErrNoSuchWorkload) {
+		// Not an internal failure: the workload finished, or the id was
+		// mistyped. Both are things the user can see and fix.
+		fmt.Fprintf(os.Stderr,
+			"workgate: no queued workload %s (it may have finished; see `workgate status`)\n", id)
+		return 2
+	}
+	if err != nil {
+		return fail(err)
+	}
+
+	label := ch.Label
+	if label == "" {
+		label = "(no label)"
+	}
+	switch {
+	case ch.State == "running":
+		note("%s %q: priority %d -> %d (already running; priority no longer affects scheduling)",
+			ch.ID, label, ch.From, ch.To)
+	case ch.From == ch.To:
+		note("%s %q: priority already %d (position %d)", ch.ID, label, ch.To, ch.Position)
+	default:
+		note("%s %q: priority %d -> %d (now position %d)",
+			ch.ID, label, ch.From, ch.To, ch.Position)
+	}
+	return 0
 }
 
 // deriveLabel builds a concise display label from the child command when no

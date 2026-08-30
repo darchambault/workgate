@@ -1,6 +1,7 @@
 # workgate
 
-Machine-global, named, FIFO-exclusive execution of locally launched workloads.
+Machine-global, named, exclusive execution of locally launched workloads,
+ordered by priority and then by arrival.
 
 `workgate` lets multiple coding-agent sessions (Codex, Claude Code, plain
 terminals) — across different projects, Git repositories, and worktrees on the
@@ -13,17 +14,19 @@ primitive, not a job scheduler: no daemon, no server, no configuration.
 workgate run gpu --label "Run integration tests" -- test-runner --suite integration
 ```
 
-Workloads targeting the same resource run strictly one at a time, in arrival
-order. Workloads targeting different resources run concurrently. The resource
-is released automatically when the wrapped command exits — or, if the process
-is killed outright, recovered automatically via heartbeat staleness.
+Workloads targeting the same resource run strictly one at a time: the highest
+priority first, and in arrival order within one priority level. Workloads
+targeting different resources run concurrently. The resource is released
+automatically when the wrapped command exits — or, if the process is killed
+outright, recovered automatically via heartbeat staleness.
 
 ## Usage
 
 ```text
-workgate run <resource> [--label "<description>"] -- <command> [args...]
+workgate run <resource> [--label "<description>"] [--priority <1-5>] -- <command> [args...]
 workgate status [<resource>] [--recent[=<count>]]
 workgate monitor [<resource>] [--interval <duration>]
+workgate priority <id> <1-5>
 ```
 
 - Everything after `--` is the child command, passed through verbatim
@@ -31,6 +34,11 @@ workgate monitor [<resource>] [--interval <duration>]
 - Resource names: `[a-zA-Z0-9][a-zA-Z0-9._-]*`, max 64 chars, case-insensitive
   (`GPU`, `Gpu`, and `gpu` share one queue).
 - `--label` is diagnostic only; without it a label is derived from the command.
+- `--priority` runs from `1` (highest) to `5` (lowest) and defaults to `3`;
+  see [Priority](#priority) below. Unlike `--label` it is not diagnostic — it
+  decides who runs next.
+- `priority` re-prioritizes a workload that is already queued, whichever
+  session started it. The id is the first column of `status`.
 - `monitor` is `status` as a live view; see [Monitoring](#monitoring) below.
 - `--recent` appends the last few workloads that finished, and how each one
   ended; see [Recent completions](#recent-completions). `monitor` always shows
@@ -39,8 +47,9 @@ workgate monitor [<resource>] [--interval <duration>]
   codes: `2` usage error, `125` internal error, `126` cannot launch, `127`
   command not found, `130` interrupted.
 - During `run`, workgate's own messages go to **stderr**, so the child's
-  stdout stays clean for piping. `status` and `monitor` are output in their
-  own right and write to **stdout**.
+  stdout stays clean for piping. `priority` confirms itself on stderr for the
+  same reason. `status` and `monitor` are output in their own right and write
+  to **stdout**.
 
 Typical output:
 
@@ -56,13 +65,53 @@ Typical output:
 RESOURCE: gpu
 
 RUNNING
-  49ce3e   pid 77900  00:04    "Workload-A"
-                               project: MyApp [main]
+  49ce3e   pid 77900  00:04    P3 "Workload-A"
+                                  project: MyApp [main]
 
 WAITING
-  1eabb7   pid 64732  00:02    "Workload-B"
-                               project: MyApp [fix-42]
+  1eabb7   pid 64732  00:02    P1 "Urgent hotfix run"
+                                  project: MyApp [hotfix]
+  70ce62   pid 51204  00:31    P3 "Workload-B"
+                                  project: MyApp [fix-42]
 ```
+
+The level-1 workload arrived last and still sorts above the waiter that has
+been queued for half a minute. The running workload keeps the resource
+regardless: priority decides who goes next, never who stops.
+
+### Priority
+
+Every workload has a level from `1` (highest) to `5` (lowest). `3` is the
+default and means "ordinary": it is what a workload gets when nobody has said
+otherwise, which is almost all of them.
+
+```sh
+workgate run gpu --priority 1 --label "Urgent hotfix run" -- test-runner
+```
+
+A workload that is already queued can be re-prioritized from anywhere — the
+session that started it is blocked inside its own `workgate run`, so somebody
+else has to speak for it:
+
+```text
+> workgate priority 1eabb7 1
+[workgate] 1eabb7 "Urgent hotfix run": priority 3 -> 1 (now position 2)
+```
+
+- **Nothing is signalled.** Each waiting workload re-reads its own level on its
+  next poll, so a change takes effect within about a second without sockets,
+  signals, or a daemon.
+- **No preemption.** A higher-priority workload waits for the running one to
+  finish. Re-prioritizing a running workload is accepted and says so, but
+  changes nothing — it is allowed because a workload can start between your
+  reading `status` and your typing its id, and failing on that race would be
+  worse than doing nothing.
+- **No aging.** A level-5 workload behind a steady supply of level-1 work waits
+  indefinitely. That is deliberate: the alternative makes "who runs next"
+  depend on the clock, and `workgate priority` is a better answer than a
+  heuristic. If something is starved, promote it.
+- A waiting workload's position can therefore go **up** as well as down. Higher
+  priority work arriving behind you is normal, not a stall.
 
 ### Monitoring
 
@@ -80,15 +129,16 @@ workgate monitor - gpu - 19:42:07
 RESOURCE: gpu
 
 RUNNING
-  49ce3e   pid 77900  00:04    "Workload-A"                      MyApp [main]
+  49ce3e   pid 77900  00:04    P3 "Workload-A"                      MyApp [main]
 
 WAITING
-  1eabb7   pid 64732  00:02    "Workload-B"                      MyApp [fix-42]
+  1eabb7   pid 64732  00:02    P1 "Urgent hotfix run"               MyApp [hotfix]
+  70ce62   pid 51204  00:31    P3 "Workload-B"                      MyApp [fix-42]
 
 LAST COMPLETED
-  b0d41c   ok         00:03    "Workload-Z"                      (just now)  MyApp [main]
-  7f2a90   exit 1     00:00    "Workload-Y"                      (2m ago)    MyApp [fix-42]
-  3c4d5e   stale      00:31    "Workload-X"                      (18m ago)   Other [main]
+  b0d41c   ok         00:03       "Workload-Z"                      (just now)  MyApp [main]
+  7f2a90   exit 1     00:00       "Workload-Y"                      (2m ago)    MyApp [fix-42]
+  3c4d5e   stale      00:31       "Workload-X"                      (18m ago)   Other [main]
 
 refreshing every 1s - Ctrl+C to stop
 ```
@@ -105,8 +155,12 @@ refreshing every 1s - Ctrl+C to stop
   abandoned workloads; it labels them `[STALE]` and leaves them to the next
   `run` or `status`. Watching a resource should not change who owns it. (The
   database is still opened normally, which applies the idempotent
-  `CREATE TABLE IF NOT EXISTS` schema step — "read-only" means no queue
-  mutation, not zero writes.)
+  `CREATE TABLE IF NOT EXISTS` schema step and, once on a database that
+  predates priorities, the `ALTER TABLE` that adds the column — "read-only"
+  means no queue mutation, not zero writes.)
+- A finished workload leaves the priority column blank: its level described a
+  queue it has already left. The column is still spent, so live and finished
+  rows stay on one grid.
 - Restrained colour picks out the structure: section headings (green for
   RUNNING, yellow for WAITING), a red `[STALE]` and a red failing outcome,
   and dimmed chrome so the eye lands on the workloads. Colour is never the
@@ -262,7 +316,9 @@ Rules:
    normal: it is waiting for other sessions. Let it wait — do not kill
    the command, do not retry, and do not run the underlying operation
    directly to bypass the queue. Queued waits can take many minutes, so
-   run the command with a generous (or no) timeout.
+   run the command with a generous (or no) timeout. Your position can go
+   up as well as down, because higher-priority work may arrive behind
+   you; that is also normal, and not a stall.
 4. While waiting, workgate is intentionally quiet. Silence does not mean
    it is hung. To see who holds the resource, run `workgate status
    <resource>` in a separate command.
@@ -276,6 +332,10 @@ Rules:
    errors, not the command's.
 8. Do not wrap commands that need no exclusive access — that only
    serializes work that could run in parallel.
+9. Do not pass `--priority` unless a rule above tells you to; the default
+   is correct for ordinary work. Never raise your own priority to get out
+   of a queue, and never run `workgate priority` on a workload you did
+   not start — that reorders another session's work.
 ```
 
 Tips for adapting the snippet:
@@ -293,6 +353,12 @@ Tips for adapting the snippet:
 - **Require labels.** Labels are how a human (or another agent) looking at
   `workgate status` understands who is blocking whom. Session/task context
   ("Claude: run integration tests for PR 42") beats a generic "tests".
+- **Say who may use priority, or say nothing.** Enumerate the cases that
+  justify a level, the same way you enumerate resources ("a hotfix build uses
+  `--priority 1`"). An agent given a vague permission will reach for the flag
+  to get out of a queue, which is exactly what rules 3 and 9 are for; silence
+  is safer than a general licence. `workgate priority` is best left a human's
+  tool.
 - **Keep the wrapped span tight.** One `workgate run` per exclusive
   operation — not one per shell command inside it, and not a whole
   multi-step task that only briefly needs the resource.
@@ -307,7 +373,7 @@ One SQLite table holds the entire coordination state:
 
 ```sql
 CREATE TABLE workloads (
-  seq               INTEGER PRIMARY KEY AUTOINCREMENT,  -- FIFO order
+  seq               INTEGER PRIMARY KEY AUTOINCREMENT,  -- arrival order
   id                TEXT UNIQUE NOT NULL,
   resource          TEXT NOT NULL,
   label             TEXT,
@@ -317,11 +383,21 @@ CREATE TABLE workloads (
   acquired_at       INTEGER,
   heartbeat_at      INTEGER NOT NULL,
   working_directory TEXT, repository_root TEXT, git_common_dir TEXT,
-  git_branch        TEXT, command_display TEXT, hostname TEXT
+  git_branch        TEXT, command_display TEXT, hostname TEXT,
+  priority          INTEGER NOT NULL DEFAULT 3 CHECK (priority BETWEEN 1 AND 5)
 );
 CREATE INDEX idx_workloads_resource_seq ON workloads(resource, seq);
+CREATE INDEX idx_workloads_resource_priority_seq ON workloads(resource, priority, seq);
 CREATE UNIQUE INDEX idx_one_running ON workloads(resource) WHERE state = 'running';
 ```
+
+`priority` is the one column that needs a real migration: `CREATE TABLE IF NOT
+EXISTS` cannot add a column to a table that already exists, so opening a
+database that predates priorities runs an `ALTER TABLE` first, inside the same
+immediate transaction that every other write uses. `NOT NULL DEFAULT 3` is what
+keeps the two binary versions compatible in both directions — rows written
+before the column existed read as the neutral level, and an older binary, whose
+`INSERT` never mentions the column, still writes a valid row.
 
 A second table holds the recent-completions ring. Nothing reads it to make a
 coordination decision; it exists only so `monitor` and `status --recent` can
@@ -341,8 +417,10 @@ CREATE TABLE completions (
 CREATE INDEX idx_completions_resource_seq ON completions(resource, seq);
 ```
 
-- **FIFO** is the `seq` autoincrement, never timestamps — in both tables, so
-  that a clock that jumps cannot reorder either the queue or the ring.
+- **Order** is `(priority, seq)`: the lower priority number first, then the
+  `seq` autoincrement within a level. `seq` is never timestamps — in both
+  tables, so that a clock that jumps cannot reorder either the queue or the
+  ring.
 - `completions.id` is deliberately not unique: a workload id is three random
   bytes, unique only among live rows, and a cosmetic collision must never be
   able to fail a release and strand a resource.
@@ -360,13 +438,19 @@ The lifecycle:
    `heartbeat_at` already set (no window where a fresh row looks stale).
 2. **Wait** — conservative polling (~750 ms); no transaction is held while
    waiting. A heartbeat goroutine refreshes `heartbeat_at` every 5 s for the
-   row's whole life. Occasional "still waiting" notices; otherwise quiet.
+   row's whole life. Each poll re-reads the row's own priority, which is what
+   lets `workgate priority` from another terminal take effect within one poll
+   interval without any signalling. Occasional "still waiting" notices;
+   otherwise quiet.
 3. **Acquire** — one short `BEGIN IMMEDIATE` transaction: delete stale rows
    for the resource (heartbeat older than 60 s), verify no owner exists and
-   that this row has the lowest waiting `seq`, then flip it to `running`.
-   Atomicity guarantees two processes can never both win, cleanup can never
-   race acquisition, and a newer workload can never overtake a healthy older
-   waiter.
+   that no waiting row for the resource outranks this one on `(priority,
+   seq)`, then flip it to `running`. Atomicity guarantees two processes can
+   never both win and cleanup can never race acquisition; `seq` is unique, so
+   `(priority, seq)` is a strict total order and exactly one waiter can pass
+   the rank check. A newer workload can overtake a healthy older waiter only
+   by having a higher priority — within a level arrival order is absolute, and
+   a running workload is never preempted.
 4. **Run** — the child runs with stdio forwarded; the database is untouched
    except for heartbeats. The child's process tree is tied to workgate
    per platform: on Windows it is placed in a Job Object with
@@ -404,7 +488,8 @@ child is never at risk: heartbeats continue regardless of child output.
 go test ./...
 ```
 
-Tests include multi-process end-to-end coverage (FIFO across real processes,
+Tests include multi-process end-to-end coverage (ordering across real
+processes, priority overtaking and live re-prioritization,
 hard-kill recovery, exit-code propagation, and completions surviving both a
 clean exit and a hard kill). `monitor` is covered through its
 redirected-output path, and its escape sequences are asserted directly; the
@@ -437,9 +522,15 @@ shorten timings; they are not user-facing configuration.
   and, on macOS/Linux, `SIGTERM`/`SIGHUP` are all handled and restore it; a
   terminal stranded by a hard kill is recovered with `reset` on macOS/Linux,
   or by opening a new tab on Windows.
+- Priorities are strict and small: five levels, arrival order within a level,
+  and no aging. A low-priority workload behind a steady supply of
+  high-priority work can wait indefinitely; `workgate priority <id> <level>`
+  is the manual remedy, deliberately a human decision rather than a scheduler
+  heuristic. There is no preemption, and no per-resource or per-project
+  default level.
 - Deliberately excluded: explicit acquire/release commands, multi-resource
-  acquisition, priorities, retries, daemons, networking, and per-project
-  scopes.
+  acquisition, preemption, priority aging, retries, daemons, networking, and
+  per-project scopes.
 - There is no history. The recent-completions ring is a display aid, bounded
   at ten per resource and expiring after a day, with no command to query it
   beyond the last few — not a record you can go back to.

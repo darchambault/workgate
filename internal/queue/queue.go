@@ -1,6 +1,7 @@
-// Package queue implements the FIFO coordination protocol: enqueueing,
-// atomic acquisition, heartbeats, stale-workload recovery, release, and
-// status queries. Every database transaction here is short; nothing holds
+// Package queue implements the coordination protocol: enqueueing, atomic
+// acquisition, heartbeats, stale-workload recovery, release, and status
+// queries. Acquisition order is (priority, seq) - the highest priority first,
+// and arrival order within a level. Every database transaction here is short; nothing holds
 // a transaction open while waiting or while a child process runs.
 package queue
 
@@ -67,6 +68,7 @@ type Workload struct {
 	Resource         string
 	Label            string
 	State            string
+	Priority         int // 1 (highest) .. 5 (lowest)
 	PID              int64
 	CreatedAt        int64 // unix milliseconds
 	AcquiredAt       int64 // unix milliseconds, 0 if never acquired
@@ -152,7 +154,31 @@ var (
 	CompletionRetention    = 24 * time.Hour
 )
 
+// Priority levels. 1 is highest, 5 is lowest, and 3 is what a workload gets
+// without --priority. Ordering is strict: a waiting workload with a lower
+// number acquires before every waiting workload with a higher one, whatever
+// their arrival order, and arrival order decides only within a level. A
+// running workload is never preempted.
+//
+// There is no aging: a level-5 workload behind a steady supply of level-1
+// work waits indefinitely. SetPriority is the remedy, deliberately a human
+// decision rather than a scheduler heuristic that would make "who runs next"
+// depend on the clock.
+const (
+	PriorityHighest = 1
+	PriorityDefault = 3
+	PriorityLowest  = 5
+)
+
 var resourceRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
+
+// idRe matches an id exactly as status prints it. newID always produces six
+// hex characters, including its crypto-failure fallback.
+var idRe = regexp.MustCompile(`^[0-9a-f]{6}$`)
+
+// ErrNoSuchWorkload reports that no queued workload has the requested id -
+// it finished, was released, or was reclaimed as stale.
+var ErrNoSuchWorkload = errors.New("no queued workload with that id")
 
 // ErrGone reports that this workload's row no longer exists — another
 // process removed it as stale (e.g. after a long machine sleep).
@@ -174,6 +200,39 @@ func ValidateResource(name string) (string, error) {
 	return name, nil
 }
 
+// ValidateID normalizes a workload id as the user reads it off status.
+// Matching is exact: ids are unique and only six characters, so a prefix would
+// buy nothing and would introduce an ambiguity case that cannot otherwise
+// occur. The only lookup failure is ErrNoSuchWorkload.
+func ValidateID(id string) (string, error) {
+	id = strings.ToLower(strings.TrimSpace(id))
+	if !idRe.MatchString(id) {
+		return "", fmt.Errorf("invalid workload id %q: expected the six characters shown by `workgate status`", id)
+	}
+	return id, nil
+}
+
+// ValidatePriority parses a user-supplied priority level.
+func ValidatePriority(s string) (int, error) {
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil {
+		return 0, fmt.Errorf("invalid priority %q: expected a whole number from %d (highest) to %d (lowest)",
+			s, PriorityHighest, PriorityLowest)
+	}
+	if err := checkPriority(n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+func checkPriority(n int) error {
+	if n < PriorityHighest || n > PriorityLowest {
+		return fmt.Errorf("priority %d is out of range: expected %d (highest) to %d (lowest)",
+			n, PriorityHighest, PriorityLowest)
+	}
+	return nil
+}
+
 func nowMillis() int64 { return time.Now().UnixMilli() }
 
 func newID() string {
@@ -186,10 +245,18 @@ func newID() string {
 	return hex.EncodeToString(b)
 }
 
-// Enqueue inserts a new waiting workload for resource. heartbeat_at is
-// initialized in the same INSERT, so there is no window in which another
-// process could consider the fresh row stale.
-func Enqueue(d *sql.DB, resource string, meta Meta) (*Workload, error) {
+// Enqueue inserts a new waiting workload for resource at the given priority.
+// heartbeat_at is initialized in the same INSERT, so there is no window in
+// which another process could consider the fresh row stale.
+//
+// priority is a parameter rather than a Meta field because Meta is diagnostic
+// context - none of it affects locking semantics - and priority decides who
+// runs next. An invalid level is an error, never silently clamped: a zero
+// value here means a caller forgot, not that it wanted PriorityDefault.
+func Enqueue(d *sql.DB, resource string, priority int, meta Meta) (*Workload, error) {
+	if err := checkPriority(priority); err != nil {
+		return nil, err
+	}
 	now := nowMillis()
 	var seq int64
 	var id string
@@ -199,11 +266,11 @@ func Enqueue(d *sql.DB, resource string, meta Meta) (*Workload, error) {
 			INSERT INTO workloads
 				(id, resource, label, state, pid, created_at, heartbeat_at,
 				 working_directory, repository_root, git_common_dir, git_branch,
-				 command_display, hostname)
-			VALUES (?, ?, ?, 'waiting', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				 command_display, hostname, priority)
+			VALUES (?, ?, ?, 'waiting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			id, resource, meta.Label, meta.PID, now, now,
 			meta.WorkingDirectory, meta.RepositoryRoot, meta.GitCommonDir,
-			meta.GitBranch, meta.CommandDisplay, meta.Hostname)
+			meta.GitBranch, meta.CommandDisplay, meta.Hostname, priority)
 		if err != nil {
 			if attempt < 3 && strings.Contains(err.Error(), "UNIQUE") {
 				continue // improbable id collision; retry with a fresh id
@@ -218,22 +285,58 @@ func Enqueue(d *sql.DB, resource string, meta Meta) (*Workload, error) {
 	}
 	return &Workload{
 		Seq: seq, ID: id, Resource: resource, Label: meta.Label,
-		State: "waiting", PID: int64(meta.PID), CreatedAt: now, HeartbeatAt: now,
+		State: "waiting", Priority: priority, PID: int64(meta.PID),
+		CreatedAt: now, HeartbeatAt: now,
 	}, nil
 }
 
-// Position returns this workload's 1-based place in the resource's queue,
-// counting every earlier workload (running or waiting). Position 1 means
-// next in line (or already eligible).
-func Position(d *sql.DB, w *Workload) (int, error) {
-	var ahead int
-	err := d.QueryRow(
-		`SELECT COUNT(*) FROM workloads WHERE resource = ? AND seq < ?`,
-		w.Resource, w.Seq).Scan(&ahead)
-	if err != nil {
+// positionQuery ranks one workload against everything queued for its resource,
+// in exactly the order List displays and TryAcquire enforces: the running
+// workload first - it holds the resource whatever its priority, because
+// workgate never preempts - then by priority, then by arrival.
+//
+// Counting the running row explicitly is the part that is easy to get wrong. A
+// plain (priority, seq) comparison would rank a waiting level-1 row above a
+// running level-3 one and report position 1 to a workload that is in fact
+// blocked behind it.
+const positionQuery = `
+SELECT COUNT(*) + 1
+  FROM workloads t JOIN workloads me ON me.id = ?
+ WHERE t.resource = me.resource AND t.id <> me.id
+   AND ( t.state = 'running'
+      OR ( me.state = 'waiting'
+           AND ( t.priority < me.priority
+              OR (t.priority = me.priority AND t.seq < me.seq) ) ) )`
+
+// rowQuerier is satisfied by both *sql.DB and *sql.Tx, so a position can be
+// read on its own or inside the transaction that just changed a priority.
+type rowQuerier interface {
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+func positionOf(q rowQuerier, id string) (int, error) {
+	var pos int
+	if err := q.QueryRow(positionQuery, id).Scan(&pos); err != nil {
 		return 0, fmt.Errorf("querying queue position: %w", err)
 	}
-	return ahead + 1, nil
+	return pos, nil
+}
+
+// Position returns this workload's 1-based place in the resource's queue: one
+// more than the number of workloads that will use the resource before it. The
+// running workload counts as ahead of every waiter. Position 1 means next in
+// line, or already running.
+//
+// The row is ranked by id rather than from w, because w's cached priority may
+// be stale - see TryAcquire. And because a higher-priority workload can arrive
+// at any time, a waiting workload's position can go up as well as down; this
+// is the number to report now, not a promise about later.
+//
+// A row already removed as stale ranks against nothing and reports 1. That is
+// diagnostic output only; reporting the row's disappearance is TryAcquire's
+// and Heartbeat's job, on the same polling loop.
+func Position(d *sql.DB, w *Workload) (int, error) {
+	return positionOf(d, w.ID)
 }
 
 // TryAcquire attempts, in a single short immediate transaction, to
@@ -241,14 +344,29 @@ func Position(d *sql.DB, w *Workload) (int, error) {
 //
 //  1. deletes stale entries for the resource (returned for diagnostics);
 //  2. verifies no running owner remains;
-//  3. verifies w is the oldest waiting workload (lowest seq);
+//  3. verifies that no waiting workload for the resource outranks w, where
+//     rank is (priority, seq): the lower priority number first, arrival order
+//     within a level;
 //  4. claims the resource.
 //
 // Because all four steps commit atomically, two processes can never both
-// conclude "the resource is free and I am next", stale cleanup cannot race
-// acquisition, and a newer workload can never overtake an older healthy
-// waiter. The partial unique index on (resource) WHERE state='running'
-// additionally enforces single ownership at the database level.
+// conclude "the resource is free and I am next", and stale cleanup cannot race
+// acquisition. seq is unique, so (priority, seq) is a strict total order and
+// exactly one waiter can pass step 3. The partial unique index on (resource)
+// WHERE state='running' additionally enforces single ownership at the database
+// level.
+//
+// Ordering is strict priority, not FIFO: a newly arrived workload can overtake
+// an older healthy waiter, but only by having a higher priority (a lower
+// number). Within one level arrival order is absolute, and a running workload
+// is never preempted. There is no aging, so a low-priority workload can be
+// starved indefinitely by a stream of higher-priority ones; SetPriority is the
+// deliberate escape hatch.
+//
+// Step 3 reads w's priority from the row rather than from w, because
+// SetPriority may have changed it since this process enqueued. That re-read is
+// also why a priority change needs no signalling: every waiter picks it up on
+// its next poll.
 func TryAcquire(d *sql.DB, w *Workload) (acquired bool, removed []StaleRemoved, err error) {
 	tx, err := d.Begin()
 	if err != nil {
@@ -265,7 +383,9 @@ func TryAcquire(d *sql.DB, w *Workload) (acquired bool, removed []StaleRemoved, 
 	// Our own row may have been deleted as stale by another process while
 	// this one was suspended (sleep, debugger). Detect that explicitly.
 	var mySeq int64
-	err = tx.QueryRow(`SELECT seq FROM workloads WHERE id = ?`, w.ID).Scan(&mySeq)
+	var myPriority int
+	err = tx.QueryRow(`SELECT seq, priority FROM workloads WHERE id = ?`, w.ID).
+		Scan(&mySeq, &myPriority)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, removed, ErrGone
 	}
@@ -283,14 +403,20 @@ func TryAcquire(d *sql.DB, w *Workload) (acquired bool, removed []StaleRemoved, 
 		return false, removed, tx.Commit() // keep the stale deletions
 	}
 
-	var oldestWaiting int64
-	if err := tx.QueryRow(
-		`SELECT MIN(seq) FROM workloads WHERE resource = ? AND state = 'waiting'`,
-		w.Resource).Scan(&oldestWaiting); err != nil {
-		return false, removed, fmt.Errorf("finding oldest waiter: %w", err)
+	// Rank, not age: a waiter outranks us if its priority number is lower, or
+	// equal and its seq is earlier. Asking "is anyone ahead of me" as a count
+	// keeps this a single comparison against a strict total order, so exactly
+	// one waiting row can ever see zero.
+	var ahead int
+	if err := tx.QueryRow(`
+		SELECT COUNT(*) FROM workloads
+		 WHERE resource = ? AND state = 'waiting'
+		   AND (priority < ? OR (priority = ? AND seq < ?))`,
+		w.Resource, myPriority, myPriority, mySeq).Scan(&ahead); err != nil {
+		return false, removed, fmt.Errorf("checking for better-placed waiters: %w", err)
 	}
-	if oldestWaiting != mySeq {
-		return false, removed, tx.Commit() // an older healthy waiter goes first
+	if ahead > 0 {
+		return false, removed, tx.Commit() // a better-placed waiter goes first
 	}
 
 	if _, err := tx.Exec(
@@ -303,6 +429,7 @@ func TryAcquire(d *sql.DB, w *Workload) (acquired bool, removed []StaleRemoved, 
 	}
 	w.State = "running"
 	w.AcquiredAt = now
+	w.Priority = myPriority
 	return true, removed, nil
 }
 
@@ -317,6 +444,70 @@ func Heartbeat(d *sql.DB, w *Workload) error {
 		return ErrGone
 	}
 	return nil
+}
+
+// PriorityChange describes a completed priority mutation, with enough context
+// for the caller to report it without a second query.
+type PriorityChange struct {
+	ID       string
+	Resource string
+	Label    string
+	State    string // the row's state at the moment of the change
+	From     int
+	To       int
+	Position int // 1-based place in the queue after the change
+}
+
+// SetPriority changes a queued workload's priority and reports where that
+// leaves it. It is the only function here that writes a row belonging to
+// another process, so it does all of its work - read, update, re-rank - in one
+// immediate transaction: the position it reports is the one that held at the
+// instant of the write.
+//
+// Nothing is notified, and nothing needs to be. Every waiter re-reads its own
+// priority from the row on its next acquisition attempt, so a change takes
+// effect within one poll interval without signalling, sockets, or a daemon.
+//
+// A running workload may be re-prioritized. The change is recorded so the
+// caller can report it, but it has no scheduling effect: the resource is
+// already held and workgate never preempts. Refusing would make the command
+// fail for a race the user cannot see - a row can go from waiting to running
+// between reading status and typing the id.
+//
+// heartbeat_at is deliberately untouched. It is a sign of life from the row's
+// owner, not from whoever re-prioritized it, and re-prioritizing an abandoned
+// workload must not resurrect it.
+func SetPriority(d *sql.DB, id string, level int) (*PriorityChange, error) {
+	if err := checkPriority(level); err != nil {
+		return nil, err
+	}
+	tx, err := d.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("beginning priority transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	ch := PriorityChange{ID: id, To: level}
+	err = tx.QueryRow(
+		`SELECT resource, IFNULL(label,''), state, priority FROM workloads WHERE id = ?`, id).
+		Scan(&ch.Resource, &ch.Label, &ch.State, &ch.From)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNoSuchWorkload
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reading workload %s: %w", id, err)
+	}
+
+	if _, err := tx.Exec(`UPDATE workloads SET priority = ? WHERE id = ?`, level, id); err != nil {
+		return nil, fmt.Errorf("setting priority: %w", err)
+	}
+	if ch.Position, err = positionOf(tx, id); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("committing priority change: %w", err)
+	}
+	return &ch, nil
 }
 
 // Release deletes w's row, letting the next queued workload acquire the
@@ -532,21 +723,24 @@ func takeStaleTx(tx *sql.Tx, resource string, now int64) ([]StaleRemoved, []Comp
 	return removed, reclaimed, rows.Err()
 }
 
-// List returns current workloads (all resources if resource is empty),
-// ordered by resource, then running before waiting, then FIFO sequence.
+// List returns current workloads (all resources if resource is empty), in the
+// order they will use their resource: by resource, then running before
+// waiting, then priority, then arrival. Display order and acquisition order
+// are the same order deliberately - a view that sorted differently from
+// TryAcquire would misreport who runs next.
 func List(d *sql.DB, resource string) ([]Workload, error) {
 	q := `SELECT seq, id, resource, IFNULL(label,''), state, IFNULL(pid,0),
 	             created_at, IFNULL(acquired_at,0), heartbeat_at,
 	             IFNULL(working_directory,''), IFNULL(repository_root,''),
 	             IFNULL(git_common_dir,''), IFNULL(git_branch,''),
-	             IFNULL(command_display,''), IFNULL(hostname,'')
+	             IFNULL(command_display,''), IFNULL(hostname,''), priority
 	      FROM workloads`
 	var args []any
 	if resource != "" {
 		q += ` WHERE resource = ?`
 		args = append(args, resource)
 	}
-	q += ` ORDER BY resource, CASE state WHEN 'running' THEN 0 ELSE 1 END, seq`
+	q += ` ORDER BY resource, CASE state WHEN 'running' THEN 0 ELSE 1 END, priority, seq`
 	rows, err := d.Query(q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("listing workloads: %w", err)
@@ -558,7 +752,7 @@ func List(d *sql.DB, resource string) ([]Workload, error) {
 		if err := rows.Scan(&w.Seq, &w.ID, &w.Resource, &w.Label, &w.State, &w.PID,
 			&w.CreatedAt, &w.AcquiredAt, &w.HeartbeatAt,
 			&w.WorkingDirectory, &w.RepositoryRoot, &w.GitCommonDir, &w.GitBranch,
-			&w.CommandDisplay, &w.Hostname); err != nil {
+			&w.CommandDisplay, &w.Hostname, &w.Priority); err != nil {
 			return nil, fmt.Errorf("reading workload row: %w", err)
 		}
 		out = append(out, w)
