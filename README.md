@@ -54,11 +54,11 @@ RESOURCE: gpu
 
 RUNNING
   49ce3e   pid 77900  00:04    "Workload-A"
-                               project: MyProject
+                               project: MyApp [main]
 
 WAITING
   1eabb7   pid 64732  00:02    "Workload-B"
-                               project: OtherProject
+                               project: MyApp [fix-42]
 ```
 
 ### Monitoring
@@ -77,10 +77,10 @@ workgate monitor - gpu - 19:42:07
 RESOURCE: gpu
 
 RUNNING
-  49ce3e   pid 77900  00:04    "Workload-A"                      MyProject
+  49ce3e   pid 77900  00:04    "Workload-A"                      MyApp [main]
 
 WAITING
-  1eabb7   pid 64732  00:02    "Workload-B"                      OtherProject
+  1eabb7   pid 64732  00:02    "Workload-B"                      MyApp [fix-42]
 
 refreshing every 1s - Ctrl+C to stop
 ```

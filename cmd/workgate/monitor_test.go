@@ -73,10 +73,11 @@ func TestStatusLinesGroupsByResourceAndSection(t *testing.T) {
 }
 
 // The non-compact layout is what `workgate status` prints, so it must keep
-// putting the project on a continuation line of its own.
+// putting the worktree on a continuation line of its own.
 func TestStatusLinesNonCompactUsesContinuationLines(t *testing.T) {
 	w := testWorkload("aaa", "gpu", "Holder", "running", 5000, 0)
 	w.RepositoryRoot = "/somewhere/MyProject"
+	w.GitBranch = "feature-x"
 	lines := plainTexts(statusLines([]queue.Workload{w}, testNow, false))
 	entry := -1
 	for i, l := range lines {
@@ -87,8 +88,60 @@ func TestStatusLinesNonCompactUsesContinuationLines(t *testing.T) {
 	if entry < 0 || entry+1 >= len(lines) {
 		t.Fatalf("no entry line with a continuation after it:\n%s", strings.Join(lines, "\n"))
 	}
-	if next := strings.TrimSpace(lines[entry+1]); next != "project: MyProject" {
-		t.Errorf("expected a project continuation line after the entry, got %q", next)
+	if next := strings.TrimSpace(lines[entry+1]); next != "project: MyProject [feature-x]" {
+		t.Errorf("expected a worktree continuation line after the entry, got %q", next)
+	}
+}
+
+// Agents that name every worktree after the main one make the directory alone
+// ambiguous, so the branch has to be there to tell two workloads apart - and
+// the name must be the worktree's own, not the repository it was cut from.
+func TestStatusLinesNamesTheWorktreeNotTheRepository(t *testing.T) {
+	one := testWorkload("aaa", "gpu", "First", "running", 5000, 0)
+	one.GitCommonDir = "/somewhere/MyProject/.git"
+	one.RepositoryRoot = "/somewhere/MyProject"
+	one.GitBranch = "main"
+	two := testWorkload("bbb", "gpu", "Second", "waiting", 2000, 0)
+	two.GitCommonDir = "/somewhere/MyProject/.git"
+	two.RepositoryRoot = "/elsewhere/MyProject-codex-42"
+	two.GitBranch = "codex/rework-queue"
+
+	for _, compact := range []bool{false, true} {
+		got := plainText(statusLines([]queue.Workload{one, two}, testNow, compact))
+		for _, want := range []string{
+			"MyProject [main]", "MyProject-codex-42 [codex/rework-queue]",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("compact=%v: missing %q:", compact, want)
+				t.Error(got)
+			}
+		}
+	}
+}
+
+// The branch is decoration around a name, so it only shows when it says
+// something: no branch recorded, or the literal "HEAD" that
+// `git rev-parse --abbrev-ref` reports for a detached head, leaves the name
+// bare rather than bracketing a non-answer.
+func TestStatusLinesWorktreeFallbacks(t *testing.T) {
+	for _, tc := range []struct {
+		desc, root, cwd, branch, want string
+	}{
+		{"no branch recorded", "/somewhere/MyProject", "", "", "MyProject"},
+		{"detached head", "/somewhere/MyProject", "", "HEAD", "MyProject"},
+		{"outside git", "", "/somewhere/scratch", "", "scratch"},
+		{"no location at all", "", "", "feature-x", ""},
+	} {
+		w := testWorkload("aaa", "gpu", "Holder", "running", 5000, 0)
+		w.RepositoryRoot, w.WorkingDirectory, w.GitBranch = tc.root, tc.cwd, tc.branch
+		if got := displayContext(w); got != tc.want {
+			t.Errorf("%s: displayContext = %q, want %q", tc.desc, got, tc.want)
+		}
+		// An unnamed worktree gets no continuation line at all.
+		got := strings.Contains(plainText(statusLines([]queue.Workload{w}, testNow, false)), "project: ")
+		if got != (tc.want != "") {
+			t.Errorf("%s: continuation line present = %v, want %v", tc.desc, got, tc.want != "")
+		}
 	}
 }
 
@@ -156,16 +209,17 @@ func TestStatusLinesCompactFlagsStaleEntries(t *testing.T) {
 
 // A narrow terminal truncates the end of a line, so the stale marker has to
 // come before the incidental metadata: losing "[STALE]" would hide the whole
-// point of the row, while losing a project name costs little.
+// point of the row, while losing a worktree and its branch costs little.
 func TestStatusLinesStaleMarkerSurvivesTruncation(t *testing.T) {
 	stale := queue.StaleThreshold.Milliseconds() + 1000
 	w := testWorkload("fd2b09", "gpu", "A workload with a fairly long label", "waiting", 751000, stale)
 	w.RepositoryRoot = "/somewhere/AProjectWithALongName"
+	w.GitBranch = "a-branch-with-a-fairly-long-name"
 	entry := statusLines([]queue.Workload{w}, testNow, true)[3]
 
 	full := entry.plain()
 	if strings.Index(full, "[STALE]") > strings.Index(full, "AProjectWithALongName") {
-		t.Errorf("the stale marker must precede the project name: %q", full)
+		t.Errorf("the stale marker must precede the worktree: %q", full)
 	}
 	// 80 columns is the assumed width when the terminal cannot be measured,
 	// so the marker has to survive a fit to it.

@@ -249,10 +249,10 @@ func cmdStatus(args []string) int {
 // split into RUNNING/WAITING sections. Both `status` and `monitor` format
 // through here so the two views cannot drift apart.
 //
-// compact folds the project onto the entry line and flags entries whose
+// compact folds the worktree onto the entry line and flags entries whose
 // heartbeat has gone stale; the monitor needs one line per workload to fit a
 // fixed-height screen. Non-compact is the `status` layout, which gives the
-// project a continuation line of its own.
+// worktree a continuation line of its own.
 //
 // Styles are attached to every line in both modes. They cost nothing where
 // they are unwanted — status prints line.plain(), and the monitor drops them
@@ -312,7 +312,7 @@ func statusLines(workloads []queue.Workload, now int64, compact bool) []line {
 			}
 			if !compact {
 				out = append(out, entry)
-				if p := displayProject(w); p != "" {
+				if p := displayContext(w); p != "" {
 					out = append(out, plainLine(entryIndent+"project: "+p))
 				}
 				continue
@@ -321,14 +321,14 @@ func statusLines(workloads []queue.Workload, now int64, compact bool) []line {
 			// this owner has stopped heartbeating, and the next run or status
 			// will clear the entry.
 			//
-			// The marker goes before the project name deliberately. A narrow
+			// The marker goes before the worktree deliberately. A narrow
 			// terminal truncates the end of the line, and losing "[STALE]"
 			// would hide the very thing the row is trying to say; losing the
-			// project name costs far less.
+			// worktree, or the branch at its tail, costs far less.
 			if now-w.HeartbeatAt > queue.StaleThreshold.Milliseconds() {
 				entry = append(entry, span{text: "  [STALE]", style: styleAlert})
 			}
-			if p := displayProject(w); p != "" {
+			if p := displayContext(w); p != "" {
 				entry = append(entry, span{text: "  " + p})
 			}
 			out = append(out, entry)
@@ -357,12 +357,25 @@ func pidSpan(pid int64) span {
 	return span{text: fmt.Sprintf("%-*s", pidWidth, fmt.Sprintf("pid %d", pid)), style: styleDim}
 }
 
-// displayProject prefers the Git-derived repository name and falls back to
-// the working directory's basename.
-func displayProject(w queue.Workload) string {
-	if w.GitCommonDir != "" && filepath.Base(w.GitCommonDir) == ".git" {
-		return filepath.Base(filepath.Dir(w.GitCommonDir))
+// displayContext names the checkout a workload runs in: the worktree
+// directory, then the branch it has checked out. Agents that name every new
+// worktree after the main one leave the directory alone unable to tell two
+// workloads apart, and the branch is what distinguishes them.
+func displayContext(w queue.Workload) string {
+	name := displayWorktree(w)
+	// "HEAD" is what `git rev-parse --abbrev-ref` reports for a detached
+	// head: a name that says nothing, so it is left off.
+	if name == "" || w.GitBranch == "" || w.GitBranch == "HEAD" {
+		return name
 	}
+	return name + " [" + w.GitBranch + "]"
+}
+
+// displayWorktree prefers the worktree checkout's basename and falls back to
+// the working directory's. It deliberately does not resolve a linked worktree
+// back to its parent repository: several worktrees of one repo is exactly the
+// case these views have to tell apart.
+func displayWorktree(w queue.Workload) string {
 	if w.RepositoryRoot != "" {
 		return filepath.Base(w.RepositoryRoot)
 	}
