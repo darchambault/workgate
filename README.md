@@ -105,6 +105,9 @@ refreshing every 1s - Ctrl+C to stop
 - Redirected output (`workgate monitor gpu | tee watch.log`) emits no escape
   sequences at all: frames are simply appended, one per interval, unstyled
   and untruncated.
+- Ctrl+C is how a monitor is meant to end, so it exits `0`. The `130`
+  interrupted code listed above belongs to `run`, where an interrupt cuts a
+  child command short.
 
 ## Scope
 
@@ -321,7 +324,10 @@ go test ./...
 ```
 
 Tests include multi-process end-to-end coverage (FIFO across real processes,
-hard-kill recovery, exit-code propagation). Environment variables
+hard-kill recovery, exit-code propagation). `monitor` is covered through its
+redirected-output path, and its escape sequences are asserted directly; the
+alternate-screen view itself needs a real console, so changes to it are worth
+running by eye. Environment variables
 `WORKGATE_DB`, `WORKGATE_HEARTBEAT_INTERVAL_MS`, `WORKGATE_STALE_THRESHOLD_MS`
 and `WORKGATE_POLL_INTERVAL_MS` exist solely so tests can isolate state and
 shorten timings; they are not user-facing configuration.
@@ -344,6 +350,11 @@ shorten timings; they are not user-facing configuration.
   purpose.
 - Waiting uses sub-second polling rather than event-driven wakeup; the
   database traffic involved is negligible.
+- Killing `monitor` outright (`SIGKILL`, `taskkill /F`) skips its cleanup and
+  leaves the terminal on the alternate screen with the cursor hidden. Ctrl+C
+  and, on macOS/Linux, `SIGTERM`/`SIGHUP` are all handled and restore it; a
+  terminal stranded by a hard kill is recovered with `reset` on macOS/Linux,
+  or by opening a new tab on Windows.
 - Deliberately excluded: explicit acquire/release commands, multi-resource
   acquisition, priorities, retries, history, daemons, networking, and
   per-project scopes.
