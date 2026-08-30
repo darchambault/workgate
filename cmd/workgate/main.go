@@ -249,9 +249,10 @@ func cmdStatus(args []string) int {
 // split into RUNNING/WAITING sections. Both `status` and `monitor` format
 // through here so the two views cannot drift apart.
 //
-// compact folds project and pid onto the entry line and flags entries whose
+// compact folds the project onto the entry line and flags entries whose
 // heartbeat has gone stale; the monitor needs one line per workload to fit a
-// fixed-height screen. Non-compact is the multi-line `status` layout.
+// fixed-height screen. Non-compact is the `status` layout, which gives the
+// project a continuation line of its own.
 //
 // Styles are attached to every line in both modes. They cost nothing where
 // they are unwanted — status prints line.plain(), and the monitor drops them
@@ -287,21 +288,32 @@ func statusLines(workloads []queue.Workload, now int64, compact bool) []line {
 			if label == "" {
 				label = "(no label)"
 			}
-			// Spans reproduce "  %-8s %-32s %s" exactly, split so the id can be
-			// dimmed: it identifies a row but is rarely what the eye wants.
+			// The label is padded only in compact mode, where more
+			// columns follow it; in the status layout it ends the line
+			// and padding it would just leave trailing whitespace.
+			labelText := fmt.Sprintf("%q", label)
+			if compact {
+				labelText = fmt.Sprintf("%-*s", labelWidth, labelText)
+			}
+			// Fixed-width columns so a row reads down as well as across:
+			// identity first (id, pid), then the elapsed time, then the
+			// label. The timer is what the eye is usually after, and it
+			// should not have to scan past a variable-length label to
+			// reach it. Each column is its own span so the id and pid can
+			// be dimmed — they identify a row but are rarely what is wanted.
 			entry := line{
 				{text: "  "},
-				{text: fmt.Sprintf("%-8s", w.ID), style: styleDim},
-				{text: " " + fmt.Sprintf("%-32s", fmt.Sprintf("%q", label))},
-				{text: " " + fmtElapsed(time.Duration(now-since)*time.Millisecond)},
+				{text: fmt.Sprintf("%-*s", idWidth, w.ID), style: styleDim},
+				{text: " "},
+				pidSpan(w.PID),
+				{text: " " + fmt.Sprintf("%-*s", elapsedWidth,
+					fmtElapsed(time.Duration(now-since)*time.Millisecond))},
+				{text: " " + labelText},
 			}
 			if !compact {
 				out = append(out, entry)
 				if p := displayProject(w); p != "" {
-					out = append(out, plainLine(fmt.Sprintf("           project: %s", p)))
-				}
-				if w.PID != 0 {
-					out = append(out, plainLine(fmt.Sprintf("           pid: %d", w.PID)))
+					out = append(out, plainLine(entryIndent+"project: "+p))
 				}
 				continue
 			}
@@ -309,7 +321,7 @@ func statusLines(workloads []queue.Workload, now int64, compact bool) []line {
 			// this owner has stopped heartbeating, and the next run or status
 			// will clear the entry.
 			//
-			// The marker goes before project and pid deliberately. A narrow
+			// The marker goes before the project name deliberately. A narrow
 			// terminal truncates the end of the line, and losing "[STALE]"
 			// would hide the very thing the row is trying to say; losing the
 			// project name costs far less.
@@ -319,13 +331,30 @@ func statusLines(workloads []queue.Workload, now int64, compact bool) []line {
 			if p := displayProject(w); p != "" {
 				entry = append(entry, span{text: "  " + p})
 			}
-			if w.PID != 0 {
-				entry = append(entry, span{text: fmt.Sprintf("  pid %d", w.PID), style: styleDim})
-			}
 			out = append(out, entry)
 		}
 	}
 	return out
+}
+
+// Column widths for an entry line: "  <id> <pid> <elapsed> <label>".
+const (
+	idWidth      = 8
+	pidWidth     = 10 // "pid " plus a six-digit pid
+	elapsedWidth = 8  // "HH:MM:SS"
+	labelWidth   = 32
+)
+
+// entryIndent aligns status's project continuation line under the label.
+var entryIndent = strings.Repeat(" ", 2+idWidth+1+pidWidth+1+elapsedWidth+1)
+
+// pidSpan renders the pid column, dimmed like the id. A workload that has no
+// pid yet still occupies the column, so the columns after it stay aligned.
+func pidSpan(pid int64) span {
+	if pid == 0 {
+		return span{text: strings.Repeat(" ", pidWidth)}
+	}
+	return span{text: fmt.Sprintf("%-*s", pidWidth, fmt.Sprintf("pid %d", pid)), style: styleDim}
 }
 
 // displayProject prefers the Git-derived repository name and falls back to

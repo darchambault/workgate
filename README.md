@@ -53,14 +53,12 @@ Typical output:
 RESOURCE: gpu
 
 RUNNING
-  49ce3e   "Workload-A"                     00:04
-           project: MyProject
-           pid: 77900
+  49ce3e   pid 77900  00:04    "Workload-A"
+                               project: MyProject
 
 WAITING
-  1eabb7   "Workload-B"                     00:02
-           project: OtherProject
-           pid: 64732
+  1eabb7   pid 64732  00:02    "Workload-B"
+                               project: OtherProject
 ```
 
 ### Monitoring
@@ -79,10 +77,10 @@ workgate monitor - gpu - 19:42:07
 RESOURCE: gpu
 
 RUNNING
-  49ce3e   "Workload-A"                     00:04  MyProject  pid 77900
+  49ce3e   pid 77900  00:04    "Workload-A"                      MyProject
 
 WAITING
-  1eabb7   "Workload-B"                     00:02  OtherProject  pid 64732
+  1eabb7   pid 64732  00:02    "Workload-B"                      OtherProject
 
 refreshing every 1s - Ctrl+C to stop
 ```

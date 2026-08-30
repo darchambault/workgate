@@ -61,7 +61,7 @@ func TestStatusLinesGroupsByResourceAndSection(t *testing.T) {
 	got := plainText(statusLines(ws, testNow, false))
 	for _, want := range []string{
 		"RESOURCE: gpu", "RESOURCE: rig", "RUNNING", "WAITING",
-		`"Holder"`, `"Waiter"`, "pid: 4242",
+		`"Holder"`, `"Waiter"`, "pid 4242",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("statusLines missing %q:\n%s", want, got)
@@ -73,10 +73,11 @@ func TestStatusLinesGroupsByResourceAndSection(t *testing.T) {
 }
 
 // The non-compact layout is what `workgate status` prints, so it must keep
-// putting project and pid on their own continuation lines.
+// putting the project on a continuation line of its own.
 func TestStatusLinesNonCompactUsesContinuationLines(t *testing.T) {
-	ws := []queue.Workload{testWorkload("aaa", "gpu", "Holder", "running", 5000, 0)}
-	lines := plainTexts(statusLines(ws, testNow, false))
+	w := testWorkload("aaa", "gpu", "Holder", "running", 5000, 0)
+	w.RepositoryRoot = "/somewhere/MyProject"
+	lines := plainTexts(statusLines([]queue.Workload{w}, testNow, false))
 	entry := -1
 	for i, l := range lines {
 		if strings.Contains(l, `"Holder"`) {
@@ -86,18 +87,17 @@ func TestStatusLinesNonCompactUsesContinuationLines(t *testing.T) {
 	if entry < 0 || entry+1 >= len(lines) {
 		t.Fatalf("no entry line with a continuation after it:\n%s", strings.Join(lines, "\n"))
 	}
-	next := strings.TrimSpace(lines[entry+1])
-	if !strings.HasPrefix(next, "pid:") && !strings.HasPrefix(next, "project:") {
-		t.Errorf("expected a project/pid continuation line after the entry, got %q", next)
+	if next := strings.TrimSpace(lines[entry+1]); next != "project: MyProject" {
+		t.Errorf("expected a project continuation line after the entry, got %q", next)
 	}
 }
 
-// Splitting the entry into spans so the id can be dimmed must not disturb the
-// column layout: the plain text has to match the original format exactly.
+// Splitting the entry into spans so the id and pid can be dimmed must not
+// disturb the column layout: the plain text has to be exactly the columns.
 func TestStatusLinesEntryLayoutIsUnchangedBySpans(t *testing.T) {
 	w := testWorkload("aaa", "gpu", "Holder", "running", 5000, 0)
 	lines := plainTexts(statusLines([]queue.Workload{w}, testNow, false))
-	want := fmt.Sprintf("  %-8s %-32s %s", "aaa", `"Holder"`, "00:05")
+	want := fmt.Sprintf("  %-8s %-10s %-8s %s", "aaa", "pid 4242", "00:05", `"Holder"`)
 	for _, l := range lines {
 		if strings.Contains(l, "Holder") {
 			if l != want {

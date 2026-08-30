@@ -310,7 +310,7 @@ func TestStatusReportsRunningAndWaiting(t *testing.T) {
 	}
 	text := string(out)
 	for _, want := range []string{"RESOURCE: status-res", "RUNNING", "WAITING",
-		"First workload", "Second workload", "pid:"} {
+		"First workload", "Second workload", "pid "} {
 		if !strings.Contains(text, want) {
 			t.Errorf("status output missing %q:\n%s", want, text)
 		}
