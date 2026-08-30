@@ -35,7 +35,9 @@ workgate monitor [<resource>] [--interval <duration>]
 - The child's exit code is propagated. Workgate's own failures use distinct
   codes: `2` usage error, `125` internal error, `126` cannot launch, `127`
   command not found, `130` interrupted.
-- Workgate's own messages go to **stderr**; the child's stdout stays clean.
+- During `run`, workgate's own messages go to **stderr**, so the child's
+  stdout stays clean for piping. `status` and `monitor` are output in their
+  own right and write to **stdout**.
 
 Typical output:
 
@@ -90,7 +92,9 @@ refreshing every 1s - Ctrl+C to stop
   `1s` and the minimum is `100ms`.
 - The view uses the terminal's alternate screen buffer, so your scrollback is
   untouched: on exit the terminal is restored and nothing is left behind.
-  Resizing the window mid-run is fine — each frame is re-fitted.
+  Resizing the window mid-run is fine — each frame is re-fitted, and a window
+  too short for the whole queue ends with a count of what did not fit rather
+  than dropping it silently.
 - **Monitoring never modifies the queue.** Unlike `status`, it does not remove
   abandoned workloads; it labels them `[STALE]` and leaves them to the next
   `run` or `status`. Watching a resource should not change who owns it. (The
