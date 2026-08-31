@@ -4,6 +4,9 @@ package main
 
 import (
 	"os"
+	"unicode/utf16"
+	"unicode/utf8"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -76,4 +79,76 @@ func enableKeys(f *os.File) (bool, func()) {
 		return false, nil
 	}
 	return true, func() { windows.SetConsoleMode(h, mode) }
+}
+
+// Reading a console. ReadConsoleInput is not in x/sys/windows, so it is bound
+// here rather than pulling in a dependency for one call.
+var procReadConsoleInput = windows.NewLazySystemDLL("kernel32.dll").NewProc("ReadConsoleInputW")
+
+// keyEvent is the only INPUT_RECORD event type worth reading here.
+const keyEvent = 0x0001
+
+// inputRecord is INPUT_RECORD with KEY_EVENT_RECORD inlined — twenty bytes,
+// the same size the union gives it. The other event types are shorter and are
+// skipped by EventType, so nothing else needs describing.
+type inputRecord struct {
+	eventType       uint16
+	_               uint16
+	keyDown         int32
+	repeatCount     uint16
+	virtualKeyCode  uint16
+	virtualScanCode uint16
+	unicodeChar     uint16
+	controlKeyState uint32
+}
+
+// readInput reads the keystrokes waiting on f.
+//
+// A console cannot be read as a file here. os.File reads one through
+// ReadConsoleW, which in this mode does not return a partial buffer: keys are
+// held until enough characters arrive to fill whatever was asked for, so a
+// monitor asking for 64 bytes sees nothing at all from a few arrow presses.
+// Reading the input records instead returns exactly what is queued, which is
+// also what every console-mode program ends up doing.
+//
+// Only the characters are taken, and ENABLE_VIRTUAL_TERMINAL_INPUT has already
+// turned the arrow keys into the escape sequences the shared decoder reads —
+// so this is a different way of reading the same bytes, not a second input
+// language. Key releases, mouse movement and window events carry no character
+// and fall away here.
+func readInput(f *os.File, buf []byte) (int, error) {
+	h := windows.Handle(f.Fd())
+	var mode uint32
+	if err := windows.GetConsoleMode(h, &mode); err != nil {
+		// Not a console — a pipe or a file — and an ordinary read is right.
+		return f.Read(buf)
+	}
+	var recs [16]inputRecord
+	for {
+		var got uint32
+		r, _, err := procReadConsoleInput.Call(uintptr(h),
+			uintptr(unsafe.Pointer(&recs[0])), uintptr(len(recs)),
+			uintptr(unsafe.Pointer(&got)))
+		if r == 0 {
+			return 0, err
+		}
+		n := 0
+		for _, rec := range recs[:got] {
+			if rec.eventType != keyEvent || rec.keyDown == 0 || rec.unicodeChar == 0 {
+				continue
+			}
+			c := rune(rec.unicodeChar)
+			// Half of a surrogate pair is never one of the monitor's keys, and
+			// encoding one alone would only put nonsense in front of the decoder.
+			if utf16.IsSurrogate(c) || n+utf8.RuneLen(c) > len(buf) {
+				continue
+			}
+			n += utf8.EncodeRune(buf[n:], c)
+		}
+		if n > 0 {
+			return n, nil
+		}
+		// A batch of releases or mouse movement. Waiting for the next one is
+		// right: returning zero would spin the caller instead.
+	}
 }

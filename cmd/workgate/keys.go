@@ -160,6 +160,11 @@ func (r *keyReader) close() {
 
 // readKeys reads in until it fails, forwarding the keys it recognises.
 //
+// The read itself is readInput, which is platform specific: a Windows console
+// cannot be read as a file here, and the difference is invisible from this
+// side. Everything after the read is shared, because the bytes are the same
+// escape sequences on both.
+//
 // This goroutine is never stopped, and the channel is never closed. Stdin
 // cannot be interrupted portably — closing it is worse than leaking it, and a
 // blocking console read on Windows does not notice a close at all — so the
@@ -177,7 +182,7 @@ func readKeys(in *os.File, out chan<- key) {
 		}
 	}
 	for {
-		n, err := in.Read(buf)
+		n, err := readInput(in, buf)
 		for _, b := range buf[:n] {
 			if k := d.next(b); k != keyNone {
 				send(k)

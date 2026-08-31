@@ -54,3 +54,8 @@ func enableKeys(f *os.File) (bool, func()) {
 	}
 	return true, func() { unix.IoctlSetTermios(fd, ioctlWriteTermios, prev) }
 }
+
+// readInput reads the keystrokes waiting on f. A terminal in cbreak mode is an
+// ordinary readable file here, which is the whole reason the Windows half of
+// this exists separately.
+func readInput(f *os.File, buf []byte) (int, error) { return f.Read(buf) }
