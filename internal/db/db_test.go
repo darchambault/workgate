@@ -1,6 +1,7 @@
 package db
 
 import (
+	"database/sql"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -228,6 +229,114 @@ func TestConcurrentOpenMigratesPriorityOnce(t *testing.T) {
 			}
 			defer d.Close()
 			_, err = d.Exec(`SELECT COUNT(*) FROM workloads WHERE priority = 3`)
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent open: %v", err)
+		}
+	}
+}
+
+// downgradeCompletions strips the command column back off, so a test can prove
+// that reopening restores it. No index to drop first: nothing indexes it.
+func downgradeCompletions(t *testing.T, path string) {
+	t.Helper()
+	d, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if _, err := d.Exec(`ALTER TABLE completions DROP COLUMN command_display`); err != nil {
+		t.Fatalf("simulating a pre-command completions schema: %v", err)
+	}
+}
+
+// TestOpenAddsTheCommandToAPreExistingCompletions mirrors the priority proof:
+// completions is a table that already exists on any database in use, so
+// CREATE TABLE IF NOT EXISTS cannot add the column and a real ALTER must.
+func TestOpenAddsTheCommandToAPreExistingCompletions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "workgate.db")
+	if d, err := Open(path); err != nil {
+		t.Fatal(err)
+	} else {
+		d.Close()
+	}
+	downgradeCompletions(t, path)
+
+	old, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Seeded through the downgraded schema, exactly as an older binary would.
+	if _, err := old.Exec(`INSERT INTO completions
+	                       (id, resource, outcome, started_at, finished_at)
+	                       VALUES ('bbb222', 'gpu', 'ok', 1, 2)`); err != nil {
+		t.Fatalf("seeding a completion: %v", err)
+	}
+	old.Close()
+
+	d, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopening: %v", err)
+	}
+	defer d.Close()
+	var command sql.NullString
+	if err := d.QueryRow(`SELECT command_display FROM completions WHERE id = 'bbb222'`).Scan(&command); err != nil {
+		t.Fatalf("command_display missing after upgrade: %v", err)
+	}
+	// There is no command to invent for a row written before the column
+	// existed, and the views render the blank line they always did.
+	if command.Valid {
+		t.Errorf("migrated completion command = %q, want NULL", command.String)
+	}
+}
+
+// TestMigratingTheCompletionCommandIsIdempotent covers the ordinary case:
+// every open of an already-current database re-runs the migration.
+func TestMigratingTheCompletionCommandIsIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "workgate.db")
+	for i := 0; i < 3; i++ {
+		d, err := Open(path)
+		if err != nil {
+			t.Fatalf("open #%d: %v", i+1, err)
+		}
+		if _, err := d.Exec(`SELECT COUNT(*) FROM completions WHERE command_display IS NULL`); err != nil {
+			t.Fatalf("command_display missing on open #%d: %v", i+1, err)
+		}
+		d.Close()
+	}
+}
+
+// TestConcurrentOpenMigratesTheCompletionCommandOnce is why this migration,
+// like priority's, runs in an immediate transaction: several sessions can
+// reach a pre-command database together, and none of them may fail.
+func TestConcurrentOpenMigratesTheCompletionCommandOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "workgate.db")
+	if d, err := Open(path); err != nil {
+		t.Fatal(err)
+	} else {
+		d.Close()
+	}
+	downgradeCompletions(t, path)
+
+	const openers = 8
+	errs := make(chan error, openers)
+	var wg sync.WaitGroup
+	for i := 0; i < openers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d, err := Open(path)
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer d.Close()
+			_, err = d.Exec(`SELECT COUNT(*) FROM completions WHERE command_display IS NULL`)
 			errs <- err
 		}()
 	}

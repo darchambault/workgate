@@ -122,9 +122,6 @@ func cmdRun(args []string) int {
 
 	cwd, _ := os.Getwd()
 	info := gitmeta.Collect(cwd)
-	if label == "" {
-		label = deriveLabel(argv)
-	}
 	meta := queue.Meta{
 		Label:            label,
 		PID:              info.PID,
@@ -194,10 +191,16 @@ func cmdRun(args []string) int {
 		if perr != nil {
 			pos = 0
 		}
+		// The label is what tells one queued workload from another; with none
+		// there is nothing to name it by, and the colon would dangle.
+		named := ""
+		if label != "" {
+			named = ": " + label
+		}
 		if pos > 0 {
-			note("Queued for %q (position %d)%s: %s", resource, pos, atPriority(priority), label)
+			note("Queued for %q (position %d)%s%s", resource, pos, atPriority(priority), named)
 		} else {
-			note("Queued for %q%s: %s", resource, atPriority(priority), label)
+			note("Queued for %q%s%s", resource, atPriority(priority), named)
 		}
 		err = queue.Await(ctx, d, w, queue.AwaitEvents{
 			OnStaleRemoved: onStale,
@@ -299,7 +302,7 @@ func cmdStatus(args []string) int {
 		if err != nil {
 			return fail(err)
 		}
-		out = append(out, completionLines(done, now, false, resource == "")...)
+		out = append(out, completionLines(done, now, resource == "")...)
 	}
 	// status is plain text: the styles the renderers attach are only ever
 	// rendered by the monitor.
@@ -372,23 +375,28 @@ func isDigits(s string) bool {
 // split into RUNNING/WAITING sections. Both `status` and `monitor` format
 // through here so the two views cannot drift apart.
 //
-// compact folds the worktree onto the entry line and flags entries whose
-// heartbeat has gone stale; the monitor needs one line per workload to fit a
-// fixed-height screen. Non-compact is the `status` layout, which gives the
-// worktree a continuation line of its own.
+// An entry is a header row of fixed-width columns, followed by its label and
+// its command on lines of their own. Stacking them is what lets both be shown
+// whole: sharing one line, they competed with the worktree and the [STALE]
+// marker for the right-hand side of the screen, so the label had to be clamped
+// and the command had nowhere to go at all.
+//
+// flagStale is the only thing the two views still disagree about. The monitor
+// labels a workload whose owner has stopped heartbeating; status never has one
+// to label, because it reclaims stale rows before it lists.
 //
 // Styles are attached to every line in both modes. They cost nothing where
 // they are unwanted — status prints line.plain(), and the monitor drops them
 // when stdout is redirected or NO_COLOR is set.
-func statusLines(workloads []queue.Workload, now int64, compact bool) []line {
-	return selectedStatusLines(workloads, now, compact, "")
+func statusLines(workloads []queue.Workload, now int64, flagStale bool) []line {
+	return selectedStatusLines(workloads, now, flagStale, "")
 }
 
 // selectedStatusLines is statusLines with the monitor's highlight: the entry
 // whose id is selected opens with a marker instead of the usual blank gutter.
 // An empty selection renders exactly what statusLines renders, which is what
 // `status` wants — it prints one frame and has nothing to select with.
-func selectedStatusLines(workloads []queue.Workload, now int64, compact bool, selected string) []line {
+func selectedStatusLines(workloads []queue.Workload, now int64, flagStale bool, selected string) []line {
 	byResource := map[string][]queue.Workload{}
 	var order []string
 	for _, w := range workloads {
@@ -417,21 +425,13 @@ func selectedStatusLines(workloads []queue.Workload, now int64, compact bool, se
 			}
 			// Fixed-width columns so a row reads down as well as across:
 			// identity first (id, then the pid or, for a finished
-			// workload, the outcome), then the timer, then the label. The
-			// timer is what the eye is usually after, and it should not
-			// have to scan past a variable-length label to reach it.
+			// workload, the outcome), then the timer, then the priority.
+			// The timer is what the eye is usually after, and every entry
+			// puts it in the same place.
 			entry := entryLine(w.ID, pidSpan(w.PID),
-				fmtElapsed(time.Duration(now-since)*time.Millisecond), w.Label,
-				w.Priority, compact)
+				fmtElapsed(time.Duration(now-since)*time.Millisecond), w.Priority)
 			if selected != "" && w.ID == selected {
 				entry[0] = span{text: rowGutterSelected, style: styleBold}
-			}
-			if !compact {
-				out = append(out, entry)
-				if p := displayContext(w); p != "" {
-					out = append(out, plainLine(entryIndent+"project: "+p))
-				}
-				continue
 			}
 			// The monitor never removes stale rows, so it labels them instead:
 			// this owner has stopped heartbeating, and the next run or status
@@ -441,13 +441,14 @@ func selectedStatusLines(workloads []queue.Workload, now int64, compact bool, se
 			// terminal truncates the end of the line, and losing "[STALE]"
 			// would hide the very thing the row is trying to say; losing the
 			// worktree, or the branch at its tail, costs far less.
-			if now-w.HeartbeatAt > queue.StaleThreshold.Milliseconds() {
+			if flagStale && now-w.HeartbeatAt > queue.StaleThreshold.Milliseconds() {
 				entry = append(entry, span{text: "  [STALE]", style: styleAlert})
 			}
 			if p := displayContext(w); p != "" {
 				entry = append(entry, span{text: "  " + p})
 			}
 			out = append(out, entry)
+			out = append(out, continuationLines(w.Label, w.CommandDisplay)...)
 		}
 	}
 	return out
@@ -457,20 +458,20 @@ func selectedStatusLines(workloads []queue.Workload, now int64, compact bool, se
 const completionsHeading = "LAST COMPLETED"
 
 // completionLines renders the recent-completions section: a heading and one
-// row per completion, newest first. It is a sibling of statusLines rather
+// entry per completion, newest first. It is a sibling of statusLines rather
 // than a mode of it — statusLines exists to group by resource and split
-// RUNNING from WAITING, and completions are a flat list — but both build
-// their rows with entryLine, so the two blocks stay on one grid.
+// RUNNING from WAITING, and completions are a flat list — but both build their
+// entries the same way, so the two blocks stay on one grid.
 //
-// showResource adds the resource to each row. It is driven by the caller's
-// scope rather than by whether these rows happen to share a resource:
+// showResource adds the resource to each header row. It is driven by the
+// caller's scope rather than by whether these rows happen to share a resource:
 // deriving it would make the column appear and disappear between monitor
 // frames as the ring turns over.
 //
 // An empty list still renders the heading. Callers that show the section
 // unconditionally check for themselves and skip it; a caller that was asked
 // for the section by name deserves an answer.
-func completionLines(cs []queue.Completion, now int64, compact, showResource bool) []line {
+func completionLines(cs []queue.Completion, now int64, showResource bool) []line {
 	out := []line{plainLine(""), styledLine(styleDim, completionsHeading)}
 	if len(cs) == 0 {
 		return append(out, styledLine(styleDim, "  (none recorded)"))
@@ -479,11 +480,9 @@ func completionLines(cs []queue.Completion, now int64, compact, showResource boo
 		// The timer column holds how long the workload ran, not how long
 		// ago it finished: the list is already newest-first, so recency is
 		// carried by the ordering, and the duration is the number that is
-		// not otherwise on screen. The label is padded in both modes here,
-		// unlike a live entry: a completion always has columns after it.
+		// not otherwise on screen.
 		entry := entryLine(c.ID, outcomeSpan(c),
-			fmtElapsed(time.Duration(c.FinishedAt-c.StartedAt)*time.Millisecond),
-			c.Label, 0, true)
+			fmtElapsed(time.Duration(c.FinishedAt-c.StartedAt)*time.Millisecond), 0)
 		// Suffix order is truncation order, most important first. Without
 		// the resource an unscoped row is unattributable; the age is next;
 		// the worktree costs the least to lose.
@@ -495,57 +494,39 @@ func completionLines(cs []queue.Completion, now int64, compact, showResource boo
 		// Padded only where the worktree follows and would otherwise sit at
 		// a different column on every row; where the age ends the line,
 		// padding it would just leave trailing whitespace.
-		if compact && context != "" {
+		if context != "" {
 			agoText = fmt.Sprintf("%-*s", agoWidth, agoText)
 		}
-		ago := span{text: "  " + agoText, style: styleDim}
-		if !compact {
-			out = append(out, append(entry, ago))
-			if context != "" {
-				out = append(out, plainLine(entryIndent+"project: "+context))
-			}
-			continue
-		}
-		entry = append(entry, ago)
+		entry = append(entry, span{text: "  " + agoText, style: styleDim})
 		if context != "" {
 			entry = append(entry, span{text: "  " + context})
 		}
 		out = append(out, entry)
+		// A completion recorded before the column existed has no command, and
+		// simply renders the one line it always did.
+		out = append(out, continuationLines(c.Label, c.CommandDisplay)...)
 	}
 	return out
 }
 
-// entryLine builds the entry grid shared by live and finished workloads:
-// "  <id> <col2> <timer> <priority> <label>". col2 is the pid for a live
-// workload and the outcome for a finished one — the pid is not merely useless
-// once the process is gone, it is misleading, because pids are recycled.
-// Keeping both row types on one grid is what lets a frame read as a single
-// table. priority is 0 for a finished workload, whose level was not recorded
-// and would say nothing about a queue it has already left; the column is still
-// spent, so the grid holds.
+// entryLine builds the header row shared by live and finished workloads:
+// "  <id> <col2> <timer> <priority>". col2 is the pid for a live workload and
+// the outcome for a finished one — the pid is not merely useless once the
+// process is gone, it is misleading, because pids are recycled. Keeping both
+// row types on one grid is what lets a frame read as a single table. priority
+// is 0 for a finished workload, whose level was not recorded and would say
+// nothing about a queue it has already left; the column is still spent, so the
+// grid holds.
 //
-// Priority sits between the timer and the label because it is a fact about the
-// queue, like the timer, and because a narrow terminal truncates from the
-// right: a column that explains why the rows are in this order should not be
-// the first thing lost.
+// Priority is last because it is a fact about the queue, like the timer, and
+// because a narrow terminal truncates from the right: the column that explains
+// why the rows are in this order should come before the worktree and the
+// markers a caller appends behind it.
 //
 // Each column is its own span so the id and col2 can carry their own style:
-// they identify a row but are rarely what is wanted. padLabel is for rows
-// with more columns after the label; where the label ends the line, padding
-// it would only leave trailing whitespace.
-func entryLine(id string, col2 span, timer, label string, priority int, padLabel bool) line {
-	if label == "" {
-		label = "(no label)"
-	}
-	labelText := fmt.Sprintf("%q", label)
-	if padLabel {
-		// Clamped, not merely padded. %-*s widens a short label but never
-		// trims a long one, so an unclamped label would push every later
-		// column right by however much a session chose to type — far enough,
-		// on a narrow screen, to truncate away the [STALE] marker that the
-		// row exists to show.
-		labelText = fmt.Sprintf("%-*s", labelWidth, clampWidth(labelText, labelWidth))
-	}
+// they identify a row but are rarely what is wanted. The label and the command
+// are not here — they are lines of their own, from continuationLines.
+func entryLine(id string, col2 span, timer string, priority int) line {
 	return line{
 		{text: rowGutter},
 		{text: fmt.Sprintf("%-*s", idWidth, id), style: styleDim},
@@ -554,14 +535,27 @@ func entryLine(id string, col2 span, timer, label string, priority int, padLabel
 		{text: " " + fmt.Sprintf("%-*s", elapsedWidth, timer)},
 		{text: " "},
 		prioritySpan(priority),
-		{text: " " + labelText},
 	}
 }
 
-// clampWidth trims s to n display columns, rune-aware. truncate cannot serve:
-// it counts bytes, and a label is arbitrary user text.
-func clampWidth(s string, n int) string {
-	return truncateLine(line{{text: s}}, n).plain()
+// continuationLines returns the rows that sit under an entry's header row: the
+// label, and then the command that was run. Each is skipped when there is none
+// — a workload with no label gets no label line, rather than a placeholder
+// standing in for one — and only a live workload has a command to show.
+//
+// Neither is clamped. Ending its own line is exactly what lets a long label be
+// read whole, and the terminal width, applied by fitFrame, is the only limit
+// either one needs. The command is dimmed: it is the least-consulted fact on
+// an entry, and it should not compete with the label above it.
+func continuationLines(label, command string) []line {
+	var out []line
+	if label != "" {
+		out = append(out, plainLine(continuationIndent+fmt.Sprintf("%q", label)))
+	}
+	if command != "" {
+		out = append(out, styledLine(styleDim, continuationIndent+command))
+	}
+	return out
 }
 
 // prioritySpan renders the priority column. It always occupies priorityWidth,
@@ -636,14 +630,13 @@ const (
 	rowGutterSelected = "> "
 )
 
-// Column widths for an entry line:
-// "  <id> <pid-or-outcome> <timer> <priority> <label>".
+// Column widths for an entry's header row:
+// "  <id> <pid-or-outcome> <timer> <priority>".
 const (
 	idWidth       = 8
 	pidWidth      = 10 // "pid " plus a six-digit pid
 	elapsedWidth  = 8  // "HH:MM:SS"
 	priorityWidth = 2  // "P" plus one level
-	labelWidth    = 32
 	agoWidth      = 10 // "(just now)", and every age the retention allows
 )
 
@@ -651,9 +644,10 @@ const (
 // count is given, matching the monitor.
 const defaultRecentCount = 3
 
-// entryIndent aligns status's project continuation line under the label.
-var entryIndent = strings.Repeat(" ",
-	2+idWidth+1+pidWidth+1+elapsedWidth+1+priorityWidth+1)
+// continuationIndent starts an entry's label and command under the pid column:
+// far enough in that a continuation cannot be misread as a header row, not so
+// far that a long command loses its tail to the right edge of the terminal.
+var continuationIndent = strings.Repeat(" ", len(rowGutter)+idWidth+1)
 
 // pidSpan renders the pid column, dimmed like the id. A workload that has no
 // pid yet still occupies the column, so the columns after it stay aligned.
@@ -868,19 +862,6 @@ func cmdPriority(args []string) int {
 			ch.ID, label, ch.From, ch.To, ch.Position)
 	}
 	return 0
-}
-
-// deriveLabel builds a concise display label from the child command when no
-// --label was supplied.
-func deriveLabel(argv []string) string {
-	parts := []string{filepath.Base(argv[0])}
-	if len(argv) > 1 {
-		parts = append(parts, argv[1])
-	}
-	if len(argv) > 2 {
-		parts = append(parts, "...")
-	}
-	return truncate(strings.Join(parts, " "), 60)
 }
 
 func truncate(s string, n int) string {

@@ -262,7 +262,8 @@ func TestSelectedRowStyleIsBold(t *testing.T) {
 	}
 }
 
-// The marker spends the columns the gutter already had, so nothing shifts.
+// The marker spends the columns the gutter already had, so nothing shifts —
+// and it marks the header row, leaving the label and command under it alone.
 func TestSelectionKeepsTheEntryGrid(t *testing.T) {
 	ws := waitingQueue()
 	plainRows := plainTexts(selectedStatusLines(ws, testNow, true, ""))
@@ -270,23 +271,33 @@ func TestSelectionKeepsTheEntryGrid(t *testing.T) {
 	if len(plainRows) != len(markedRows) {
 		t.Fatalf("selection changed the line count: %d vs %d", len(plainRows), len(markedRows))
 	}
+	marked := 0
 	for i := range plainRows {
-		if !strings.Contains(plainRows[i], "ccc") {
+		if !strings.HasPrefix(plainRows[i], rowGutter+"ccc") {
+			if plainRows[i] != markedRows[i] {
+				t.Errorf("an unselected line changed:\n %q\n %q", plainRows[i], markedRows[i])
+			}
 			continue
 		}
-		if a, b := strings.Index(plainRows[i], `"Second"`), strings.Index(markedRows[i], `"Second"`); a != b {
-			t.Errorf("label moved with the marker: column %d vs %d\n %q\n %q",
-				a, b, plainRows[i], markedRows[i])
+		marked++
+		if !strings.HasPrefix(markedRows[i], rowGutterSelected) {
+			t.Fatalf("the selected header row is not marked: %q", markedRows[i])
 		}
+		if a, b := plainRows[i][len(rowGutter):], markedRows[i][len(rowGutterSelected):]; a != b {
+			t.Errorf("the marker shifted the row:\n %q\n %q", a, b)
+		}
+	}
+	if marked != 1 {
+		t.Errorf("marked rows = %d, want exactly the selected header row", marked)
 	}
 }
 
 // status has nothing to select with, and must never print a marker.
 func TestStatusLinesNeverMarksARow(t *testing.T) {
-	for _, compact := range []bool{false, true} {
-		for _, l := range plainTexts(statusLines(waitingQueue(), testNow, compact)) {
+	for _, flagStale := range []bool{false, true} {
+		for _, l := range plainTexts(statusLines(waitingQueue(), testNow, flagStale)) {
 			if strings.HasPrefix(l, rowGutterSelected) {
-				t.Errorf("compact=%v: status marked a row: %q", compact, l)
+				t.Errorf("flagStale=%v: status marked a row: %q", flagStale, l)
 			}
 		}
 	}

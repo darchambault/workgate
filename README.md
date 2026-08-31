@@ -33,7 +33,9 @@ workgate priority <id> <1-5>
   (no shell interpretation; quote arguments for your own shell as usual).
 - Resource names: `[a-zA-Z0-9][a-zA-Z0-9._-]*`, max 64 chars, case-insensitive
   (`GPU`, `Gpu`, and `gpu` share one queue).
-- `--label` is diagnostic only; without it a label is derived from the command.
+- `--label` is diagnostic only. Without it an entry simply has no label: the
+  views show the command on a line of its own regardless, and no placeholder
+  stands in for the description you did not write.
 - `--priority` runs from `1` (highest) to `5` (lowest) and defaults to `3`;
   see [Priority](#priority) below. Unlike `--label` it is not diagnostic — it
   decides who runs next.
@@ -66,14 +68,17 @@ Typical output:
 RESOURCE: gpu
 
 RUNNING
-  49ce3e   pid 77900  00:04    P3 "Workload-A"
-                                  project: MyApp [main]
+  49ce3e   pid 77900  00:04    P3  MyApp [main]
+           "Workload-A"
+           test-runner --suite integration
 
 WAITING
-  1eabb7   pid 64732  00:02    P1 "Urgent hotfix run"
-                                  project: MyApp [hotfix]
-  70ce62   pid 51204  00:31    P3 "Workload-B"
-                                  project: MyApp [fix-42]
+  1eabb7   pid 64732  00:02    P1  MyApp [hotfix]
+           "Urgent hotfix run"
+           test-runner --suite hotfix
+  70ce62   pid 51204  00:31    P3  MyApp [fix-42]
+           "Workload-B"
+           test-runner --suite regression
 ```
 
 The level-1 workload arrived last and still sorts above the waiter that has
@@ -132,16 +137,28 @@ workgate monitor - gpu - 19:42:07
 RESOURCE: gpu
 
 RUNNING
-  49ce3e   pid 77900  00:04    P3 "Workload-A"                      MyApp [main]
+  49ce3e   pid 77900  00:04    P3  MyApp [main]
+           "Workload-A"
+           test-runner --suite integration
 
 WAITING
-> 1eabb7   pid 64732  00:02    P1 "Urgent hotfix run"               MyApp [hotfix]
-  70ce62   pid 51204  00:31    P3 "Workload-B"                      MyApp [fix-42]
+> 1eabb7   pid 64732  00:02    P1  MyApp [hotfix]
+           "Urgent hotfix run"
+           test-runner --suite hotfix
+  70ce62   pid 51204  00:31    P3  MyApp [fix-42]
+           "Workload-B"
+           test-runner --suite regression
 
 LAST COMPLETED
-  b0d41c   ok         00:03       "Workload-Z"                      (just now)  MyApp [main]
-  7f2a90   exit 1     00:00       "Workload-Y"                      (2m ago)    MyApp [fix-42]
-  3c4d5e   stale      00:31       "Workload-X"                      (18m ago)   Other [main]
+  b0d41c   ok         00:03        (just now)  MyApp [main]
+           "Workload-Z"
+           test-runner --suite smoke
+  7f2a90   exit 1     00:00        (2m ago)    MyApp [fix-42]
+           "Workload-Y"
+           test-runner --suite regression
+  3c4d5e   stale      00:31        (18m ago)   Other [main]
+           "Workload-X"
+           build.sh --release
 
 refreshing every 1s - up/down select - right raises priority - q to stop
 ```
@@ -178,9 +195,19 @@ refreshing every 1s - up/down select - right raises priority - q to stop
   - Keys need a terminal at **both** ends. With stdin or stdout redirected, or
     on a console too old for virtual terminal input, the monitor is silently the
     read-only view it has always been — the footer only offers keys that work.
+- **An entry is up to three lines**: a header row of fixed-width columns —
+  id, pid, elapsed, priority, then the worktree and its branch — followed by
+  the label and the command, each on a line of its own and indented under the
+  id. Either continuation is dropped when there is nothing to put on it, so an
+  unlabelled workload costs two lines rather than spending one on a
+  placeholder. Stacking is what lets a long label and a long command be read
+  whole: sharing one row, they competed with the worktree and the `[STALE]`
+  marker for the right-hand side of the screen. `status` prints exactly the
+  same entry, so the two views cannot drift apart.
 - A finished workload leaves the priority column blank: its level described a
   queue it has already left. The column is still spent, so live and finished
-  rows stay on one grid.
+  rows stay on one grid — and a finished entry stacks exactly like a live one,
+  label and command included.
 - Restrained colour picks out the structure: section headings (green for
   RUNNING, yellow for WAITING), a red `[STALE]` and a red failing outcome,
   and dimmed chrome so the eye lands on the workloads. Colour is never the
@@ -209,15 +236,17 @@ nowhere to look. `monitor` therefore ends with a `LAST COMPLETED` section, and
 No active workgate workloads.
 
 LAST COMPLETED
-  b0d41c   ok         00:03    "Workload-Z"                      (just now)
-                               project: MyApp [main]
-  7f2a90   exit 1     00:00    "Workload-Y"                      (2m ago)
-                               project: MyApp [fix-42]
+  b0d41c   ok         00:03        (just now)  MyApp [main]
+           "Workload-Z"
+           test-runner --suite smoke
+  7f2a90   exit 1     00:00        (2m ago)    MyApp [fix-42]
+           "Workload-Y"
+           test-runner --suite regression
 ```
 
-- A finished row sits on the same columns as a live one, so a frame reads as
-  one table. The column a live workload spends on its pid carries the
-  **outcome** instead — a pid is not merely useless once the process is gone,
+- A finished entry's header row sits on the same columns as a live one, so a
+  frame reads as one table. The column a live workload spends on its pid
+  carries the **outcome** instead — a pid is not merely useless once the process is gone,
   it is misleading, because pids get recycled. The timer column carries how
   long the workload **ran**; the list is already newest-first, so the age in
   brackets is what says when.
@@ -228,6 +257,11 @@ LAST COMPLETED
   though, since `monitor` never removes a row, such a workload reads
   `[STALE]` in the live section until the next `run` or `status` reclaims it
   and moves it down here.
+- The command is copied off the workload row in the same transaction that
+  deletes it, so it survives however the workload ended — including the
+  reclaim path, where nobody was around to release it. A completion recorded
+  by a version that predates the column simply has no command line; there is
+  none to invent for it.
 - `monitor` always shows three. `status` shows none unless asked: `--recent`
   for three, `--recent=<count>` for up to ten.
 - The section is last on screen, so a window too short for everything drops it

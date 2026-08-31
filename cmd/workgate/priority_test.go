@@ -19,15 +19,15 @@ func TestStatusLinesShowsPriority(t *testing.T) {
 	deferred.Priority = queue.PriorityLowest
 	ws := []queue.Workload{holder, urgent, deferred}
 
-	for _, compact := range []bool{false, true} {
-		got := plainText(statusLines(ws, testNow, compact))
+	for _, flagStale := range []bool{false, true} {
+		got := plainText(statusLines(ws, testNow, flagStale))
 		for _, want := range []string{"P3", "P1", "P5"} {
 			if !strings.Contains(got, want) {
-				t.Errorf("compact=%v: missing %q:\n%s", compact, want, got)
+				t.Errorf("flagStale=%v: missing %q:\n%s", flagStale, want, got)
 			}
 		}
 		if strings.Index(got, `"Urgent"`) > strings.Index(got, `"Deferred"`) {
-			t.Errorf("compact=%v: waiting rows must print in run order:\n%s", compact, got)
+			t.Errorf("flagStale=%v: waiting rows must print in run order:\n%s", flagStale, got)
 		}
 	}
 }
@@ -39,21 +39,22 @@ func TestStatusLinesKeepsTheColumnForAnUnknownPriority(t *testing.T) {
 	unknown := testWorkload("bbb", "gpu", "Unknown", "waiting", 2000, 0)
 	unknown.Priority = 0
 
+	known.RepositoryRoot, unknown.RepositoryRoot = "/somewhere/Proj", "/somewhere/Proj"
 	lines := plainTexts(statusLines([]queue.Workload{known, unknown}, testNow, true))
 	var a, b string
 	for _, l := range lines {
 		switch {
-		case strings.Contains(l, `"Known"`):
+		case strings.HasPrefix(l, "  aaa"):
 			a = l
-		case strings.Contains(l, `"Unknown"`):
+		case strings.HasPrefix(l, "  bbb"):
 			b = l
 		}
 	}
 	if a == "" || b == "" {
-		t.Fatalf("missing entry lines:\n%s", strings.Join(lines, "\n"))
+		t.Fatalf("missing header rows:\n%s", strings.Join(lines, "\n"))
 	}
-	if strings.Index(a, `"Known"`) != strings.Index(b, `"Unknown"`) {
-		t.Errorf("label columns differ:\n known   %q\n unknown %q", a, b)
+	if strings.Index(a, "Proj") != strings.Index(b, "Proj") {
+		t.Errorf("worktree columns differ:\n known   %q\n unknown %q", a, b)
 	}
 }
 
@@ -81,58 +82,56 @@ func TestStatusLinesPriorityStyles(t *testing.T) {
 	}
 }
 
-// The compact label is clamped, not just padded. Without that, a long label
-// pushes [STALE] off a narrow screen — see TestStatusLinesStaleMarkerSurvives-
-// Truncation, which is the case this protects.
-func TestStatusLinesCompactClampsTheLabelColumn(t *testing.T) {
-	long := testWorkload("aaa", "gpu", strings.Repeat("x", 200), "running", 5000, 0)
-	short := testWorkload("bbb", "gpu", "Short", "waiting", 2000, 0)
-	lines := plainTexts(statusLines([]queue.Workload{long, short}, testNow, true))
-	if len(lines) < 2 {
-		t.Fatalf("expected entry lines:\n%s", strings.Join(lines, "\n"))
-	}
-	var widths []int
-	for _, l := range lines {
-		if strings.Contains(l, `"`) {
-			widths = append(widths, len(l))
+// A label is no longer clamped anywhere: it ends its own line, so a long one
+// cannot push the worktree or the [STALE] marker off a narrow screen. See
+// TestStatusLinesStaleMarkerSurvivesTruncation, which is what used to need it.
+func TestLabelIsShownWholeInBothViews(t *testing.T) {
+	long := strings.Repeat("x", 200)
+	w := testWorkload("aaa", "gpu", long, "running", 5000, 0)
+	w.RepositoryRoot = "/somewhere/MyProject"
+	for _, flagStale := range []bool{false, true} {
+		lines := plainTexts(statusLines([]queue.Workload{w}, testNow, flagStale))
+		if !strings.Contains(strings.Join(lines, "\n"), long) {
+			t.Errorf("flagStale=%v: the label was clamped:\n%s", flagStale, strings.Join(lines, "\n"))
 		}
-	}
-	if len(widths) != 2 {
-		t.Fatalf("entries = %d, want 2", len(widths))
-	}
-	if widths[0] != widths[1] {
-		t.Errorf("a long label changed the row width: %d vs %d", widths[0], widths[1])
-	}
-	// Non-compact is `status`, where the label ends the line and is left whole.
-	full := plainText(statusLines([]queue.Workload{long}, testNow, false))
-	if !strings.Contains(full, strings.Repeat("x", 200)) {
-		t.Error("status must not clamp the label; only the monitor's grid needs it")
+		// And it cannot have moved the header row's own columns.
+		for _, l := range lines {
+			if strings.HasPrefix(l, "  aaa") && !strings.HasSuffix(l, "MyProject") {
+				t.Errorf("flagStale=%v: header row = %q", flagStale, l)
+			}
+		}
 	}
 }
 
-// The continuation line under a `status` entry has to start where the label
-// does, and the indent is computed from the column widths rather than measured.
-// Adding a column is exactly when that arithmetic goes wrong.
-func TestStatusLinesContinuationAlignsWithTheLabel(t *testing.T) {
+// The label and command under an entry start where continuationIndent says,
+// and that indent is computed from the column widths rather than measured.
+// Adding or resizing a column is exactly when that arithmetic goes wrong.
+func TestContinuationsStartAtTheComputedIndent(t *testing.T) {
 	w := testWorkload("aaa", "gpu", "Holder", "running", 5000, 0)
-	w.RepositoryRoot = "/somewhere/MyProject"
+	w.CommandDisplay = "go test ./..."
 	lines := plainTexts(statusLines([]queue.Workload{w}, testNow, false))
 	for i, l := range lines {
-		if !strings.Contains(l, `"Holder"`) {
+		if !strings.HasPrefix(l, "  aaa") {
 			continue
 		}
-		if got := strings.Index(l, `"Holder"`); got != len(entryIndent) {
-			t.Errorf("label starts at column %d, entryIndent is %d", got, len(entryIndent))
+		if i+2 >= len(lines) {
+			t.Fatal("no label and command under the header row")
 		}
-		if i+1 >= len(lines) {
-			t.Fatal("no continuation line after the entry")
+		// The header's own columns end exactly where a continuation begins is
+		// not the claim: the indent is deliberately shorter, so a continuation
+		// cannot be misread as a header row but a long command keeps its tail.
+		if len(continuationIndent) >= len(l) {
+			t.Errorf("continuationIndent %d is not inside the header row %q", len(continuationIndent), l)
 		}
-		if got := strings.Index(lines[i+1], "project:"); got != len(entryIndent) {
-			t.Errorf("continuation starts at column %d, want %d", got, len(entryIndent))
+		if got := strings.Index(lines[i+1], `"Holder"`); got != len(continuationIndent) {
+			t.Errorf("label starts at column %d, continuationIndent is %d", got, len(continuationIndent))
+		}
+		if got := strings.Index(lines[i+2], "go test"); got != len(continuationIndent) {
+			t.Errorf("command starts at column %d, want %d", got, len(continuationIndent))
 		}
 		return
 	}
-	t.Fatalf("no entry line found:\n%s", strings.Join(lines, "\n"))
+	t.Fatalf("no header row found:\n%s", strings.Join(lines, "\n"))
 }
 
 func TestParseRunArgs(t *testing.T) {

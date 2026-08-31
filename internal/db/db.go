@@ -118,7 +118,11 @@ CREATE TABLE IF NOT EXISTS completions (
 	finished_at       INTEGER NOT NULL,
 	working_directory TEXT,
 	repository_root   TEXT,
-	git_branch        TEXT
+	git_branch        TEXT,
+	-- Declared last for the same reason priority is on workloads: a database
+	-- created here and one brought up to date by migrateCompletionCommand
+	-- (which can only append) must have the same column order.
+	command_display   TEXT
 );
 -- Ordering is by seq everywhere, for display and for pruning alike: seq is
 -- the real completion order, where finished_at is wall clock and can jump.
@@ -134,6 +138,11 @@ CREATE INDEX IF NOT EXISTS idx_completions_resource_seq ON completions(resource,
 const (
 	addPriorityColumn = `ALTER TABLE workloads ADD COLUMN priority INTEGER NOT NULL DEFAULT 3 CHECK (priority BETWEEN 1 AND 5)`
 
+	// The command a completion ran. Nullable with no default, so rows written
+	// before it existed read back as NULL and render as the blank line they
+	// have always been - there is no command to invent for them.
+	addCompletionCommand = `ALTER TABLE completions ADD COLUMN command_display TEXT`
+
 	// Acquisition order is (priority, seq) within a resource; this index says
 	// so. idx_workloads_resource_seq stays, because arrival order is still what
 	// orders a level and what List falls back on.
@@ -144,7 +153,40 @@ func migrate(d *sql.DB) error {
 	if _, err := d.Exec(schema); err != nil {
 		return fmt.Errorf("initializing schema: %w", err)
 	}
-	return migratePriority(d)
+	if err := migratePriority(d); err != nil {
+		return err
+	}
+	return migrateCompletionCommand(d)
+}
+
+// migrateCompletionCommand adds the command column to a completions table that
+// predates it, the same way and for the same reason migratePriority does.
+// There is no index to create alongside it: the column is display-only and
+// nothing ever selects or orders by it.
+func migrateCompletionCommand(d *sql.DB) error {
+	tx, err := d.Begin()
+	if err != nil {
+		return fmt.Errorf("beginning schema migration: %w", err)
+	}
+	defer tx.Rollback()
+
+	has, err := hasColumn(tx, "completions", "command_display")
+	if err != nil {
+		return err
+	}
+	if has {
+		return tx.Commit()
+	}
+	if _, alterErr := tx.Exec(addCompletionCommand); alterErr != nil {
+		// As in migratePriority, the condition that matters is "the column
+		// exists", not "my ALTER succeeded".
+		if has, err = hasColumn(tx, "completions", "command_display"); err != nil {
+			return err
+		} else if !has {
+			return fmt.Errorf("adding the command_display column: %w", alterErr)
+		}
+	}
+	return tx.Commit()
 }
 
 // migratePriority adds the priority column to a database that predates it.

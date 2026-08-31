@@ -74,24 +74,86 @@ func TestStatusLinesGroupsByResourceAndSection(t *testing.T) {
 	}
 }
 
-// The non-compact layout is what `workgate status` prints, so it must keep
-// putting the worktree on a continuation line of its own.
-func TestStatusLinesNonCompactUsesContinuationLines(t *testing.T) {
+// An entry is a header row, then its label, then the command that was run.
+// Both views stack the same way: the split exists so a long label and a long
+// command can be read whole, which is not something one view needs and the
+// other does not.
+func TestEntryStacksHeaderLabelAndCommand(t *testing.T) {
 	w := testWorkload("aaa", "gpu", "Holder", "running", 5000, 0)
 	w.RepositoryRoot = "/somewhere/MyProject"
 	w.GitBranch = "feature-x"
-	lines := plainTexts(statusLines([]queue.Workload{w}, testNow, false))
-	entry := -1
-	for i, l := range lines {
-		if strings.Contains(l, `"Holder"`) {
-			entry = i
+	w.CommandDisplay = "go test ./..."
+
+	for _, flagStale := range []bool{false, true} {
+		lines := plainTexts(statusLines([]queue.Workload{w}, testNow, flagStale))
+		header := -1
+		for i, l := range lines {
+			if strings.HasPrefix(l, "  aaa") {
+				header = i
+			}
+		}
+		if header < 0 || header+2 >= len(lines) {
+			t.Fatalf("flagStale=%v: expected a header and two lines under it:\n%s",
+				flagStale, strings.Join(lines, "\n"))
+		}
+		// The header carries the columns and the worktree and nothing else:
+		// the label and the command no longer compete for its tail.
+		if got := lines[header]; !strings.HasSuffix(got, "MyProject [feature-x]") {
+			t.Errorf("flagStale=%v: header = %q, want it to end at the worktree", flagStale, got)
+		}
+		if strings.Contains(lines[header], "Holder") {
+			t.Errorf("flagStale=%v: the label belongs on its own line, not %q", flagStale, lines[header])
+		}
+		if got := lines[header+1]; got != continuationIndent+`"Holder"` {
+			t.Errorf("flagStale=%v: label line = %q", flagStale, got)
+		}
+		if got := lines[header+2]; got != continuationIndent+"go test ./..." {
+			t.Errorf("flagStale=%v: command line = %q", flagStale, got)
 		}
 	}
-	if entry < 0 || entry+1 >= len(lines) {
-		t.Fatalf("no entry line with a continuation after it:\n%s", strings.Join(lines, "\n"))
+}
+
+// Each continuation is skipped when there is nothing to put on it, rather
+// than spending a line on a placeholder standing in for one.
+func TestEntryOmitsMissingLabelAndCommand(t *testing.T) {
+	for _, tc := range []struct {
+		desc, label, command string
+		want                 []string
+	}{
+		{"both", "Holder", "go test", []string{`"Holder"`, "go test"}},
+		{"no label", "", "go test", []string{"go test"}},
+		{"no command", "Holder", "", []string{`"Holder"`}},
+		{"neither", "", "", nil},
+	} {
+		w := testWorkload("aaa", "gpu", tc.label, "running", 5000, 0)
+		w.CommandDisplay = tc.command
+		lines := plainTexts(statusLines([]queue.Workload{w}, testNow, true))
+		var got []string
+		for _, l := range lines {
+			if strings.HasPrefix(l, continuationIndent) {
+				got = append(got, strings.TrimSpace(l))
+			}
+		}
+		if strings.Join(got, "|") != strings.Join(tc.want, "|") {
+			t.Errorf("%s: continuations = %q, want %q", tc.desc, got, tc.want)
+		}
+		if strings.Contains(strings.Join(lines, "\n"), "no label") {
+			t.Errorf("%s: an absent label should cost no line at all", tc.desc)
+		}
 	}
-	if next := strings.TrimSpace(lines[entry+1]); next != "project: MyProject [feature-x]" {
-		t.Errorf("expected a worktree continuation line after the entry, got %q", next)
+}
+
+// The two views drifting apart is what the shared renderer exists to prevent,
+// and flagStale is the only thing left that can tell them apart.
+func TestStatusAndMonitorRenderTheSameEntry(t *testing.T) {
+	w := testWorkload("aaa", "gpu", "Holder", "running", 5000, 0)
+	w.RepositoryRoot = "/somewhere/MyProject"
+	w.GitBranch = "main"
+	w.CommandDisplay = "go test ./..."
+	ws := []queue.Workload{w}
+	monitor, status := plainText(statusLines(ws, testNow, true)), plainText(statusLines(ws, testNow, false))
+	if monitor != status {
+		t.Errorf("the views differ on a healthy workload:\n monitor:\n%s\n status:\n%s", monitor, status)
 	}
 }
 
@@ -108,13 +170,13 @@ func TestStatusLinesNamesTheWorktreeNotTheRepository(t *testing.T) {
 	two.RepositoryRoot = "/elsewhere/MyProject-codex-42"
 	two.GitBranch = "codex/rework-queue"
 
-	for _, compact := range []bool{false, true} {
-		got := plainText(statusLines([]queue.Workload{one, two}, testNow, compact))
+	for _, flagStale := range []bool{false, true} {
+		got := plainText(statusLines([]queue.Workload{one, two}, testNow, flagStale))
 		for _, want := range []string{
 			"MyProject [main]", "MyProject-codex-42 [codex/rework-queue]",
 		} {
 			if !strings.Contains(got, want) {
-				t.Errorf("compact=%v: missing %q:", compact, want)
+				t.Errorf("flagStale=%v: missing %q:", flagStale, want)
 				t.Error(got)
 			}
 		}
@@ -139,73 +201,54 @@ func TestStatusLinesWorktreeFallbacks(t *testing.T) {
 		if got := displayContext(w); got != tc.want {
 			t.Errorf("%s: displayContext = %q, want %q", tc.desc, got, tc.want)
 		}
-		// An unnamed worktree gets no continuation line at all.
-		got := strings.Contains(plainText(statusLines([]queue.Workload{w}, testNow, false)), "project: ")
-		if got != (tc.want != "") {
-			t.Errorf("%s: continuation line present = %v, want %v", tc.desc, got, tc.want != "")
+		// An unnamed worktree leaves the header row ending at its columns.
+		bare := false
+		for _, l := range plainTexts(statusLines([]queue.Workload{w}, testNow, false)) {
+			if strings.HasPrefix(l, "  aaa") {
+				bare = strings.HasSuffix(l, "P3")
+			}
+		}
+		if bare != (tc.want == "") {
+			t.Errorf("%s: bare header row = %v, want %v", tc.desc, bare, tc.want == "")
 		}
 	}
 }
 
-// Splitting the entry into spans so the id and pid can be dimmed must not
-// disturb the column layout: the plain text has to be exactly the columns.
-func TestStatusLinesEntryLayoutIsUnchangedBySpans(t *testing.T) {
+// Splitting the header row into spans so the id and pid can be dimmed must
+// not disturb the column layout: the plain text has to be exactly the columns.
+func TestEntryHeaderLayoutIsUnchangedBySpans(t *testing.T) {
 	w := testWorkload("aaa", "gpu", "Holder", "running", 5000, 0)
 	lines := plainTexts(statusLines([]queue.Workload{w}, testNow, false))
-	want := fmt.Sprintf("  %-8s %-10s %-8s %-2s %s", "aaa", "pid 4242", "00:05", "P3", `"Holder"`)
+	want := fmt.Sprintf("  %-8s %-10s %-8s %-2s", "aaa", "pid 4242", "00:05", "P3")
 	for _, l := range lines {
-		if strings.Contains(l, "Holder") {
+		if strings.HasPrefix(l, "  aaa") {
 			if l != want {
-				t.Errorf("entry line = %q, want %q", l, want)
+				t.Errorf("header row = %q, want %q", l, want)
 			}
 			return
 		}
 	}
-	t.Fatalf("no entry line found:\n%s", strings.Join(lines, "\n"))
+	t.Fatalf("no header row found:\n%s", strings.Join(lines, "\n"))
 }
 
-// The compact layout is the monitor's: one line per workload, so a fixed
-// screen height holds as many as possible.
-func TestStatusLinesCompactIsOneLinePerWorkload(t *testing.T) {
-	ws := []queue.Workload{
-		testWorkload("aaa", "gpu", "Holder", "running", 5000, 0),
-		testWorkload("bbb", "gpu", "Waiter", "waiting", 2000, 0),
-	}
-	lines := plainTexts(statusLines(ws, testNow, true))
-	entries := 0
-	for _, l := range lines {
-		if strings.Contains(l, `"`) {
-			entries++
-		}
-		if strings.Contains(l, "pid:") {
-			t.Errorf("compact mode should not emit a pid continuation line: %q", l)
-		}
-	}
-	if entries != 2 {
-		t.Errorf("entries = %d, want 2:\n%s", entries, strings.Join(lines, "\n"))
-	}
-	if !strings.Contains(strings.Join(lines, "\n"), "pid 4242") {
-		t.Errorf("compact entry should fold the pid inline:\n%s", strings.Join(lines, "\n"))
-	}
-}
-
-func TestStatusLinesCompactFlagsStaleEntries(t *testing.T) {
+func TestMonitorFlagsStaleEntries(t *testing.T) {
 	stale := queue.StaleThreshold.Milliseconds() + 1000
 	ws := []queue.Workload{
 		testWorkload("aaa", "gpu", "Alive", "running", 5000, 0),
 		testWorkload("bbb", "gpu", "Abandoned", "waiting", 90000, stale),
 	}
+	// The marker rides the header row, which is the line carrying the id.
 	for _, l := range plainTexts(statusLines(ws, testNow, true)) {
 		switch {
-		case strings.Contains(l, `"Alive"`) && strings.Contains(l, "[STALE]"):
+		case strings.HasPrefix(l, "  aaa") && strings.Contains(l, "[STALE]"):
 			t.Errorf("healthy entry marked stale: %q", l)
-		case strings.Contains(l, `"Abandoned"`) && !strings.Contains(l, "[STALE]"):
+		case strings.HasPrefix(l, "  bbb") && !strings.Contains(l, "[STALE]"):
 			t.Errorf("stale entry not marked: %q", l)
 		}
 	}
-	// Non-compact is `status` output, which never shows the marker.
+	// status reclaims stale rows before it lists, so it never has one to mark.
 	if strings.Contains(plainText(statusLines(ws, testNow, false)), "[STALE]") {
-		t.Error("non-compact statusLines should not emit [STALE]")
+		t.Error("statusLines with flagStale off should not emit [STALE]")
 	}
 }
 
@@ -217,8 +260,12 @@ func TestStatusLinesStaleMarkerSurvivesTruncation(t *testing.T) {
 	w := testWorkload("fd2b09", "gpu", "A workload with a fairly long label", "waiting", 751000, stale)
 	w.RepositoryRoot = "/somewhere/AProjectWithALongName"
 	w.GitBranch = "a-branch-with-a-fairly-long-name"
-	entry := statusLines([]queue.Workload{w}, testNow, true)[3]
-
+	var entry line
+	for _, l := range statusLines([]queue.Workload{w}, testNow, true) {
+		if strings.HasPrefix(l.plain(), "  fd2b09") {
+			entry = l
+		}
+	}
 	full := entry.plain()
 	if strings.Index(full, "[STALE]") > strings.Index(full, "AProjectWithALongName") {
 		t.Errorf("the stale marker must precede the worktree: %q", full)
@@ -239,6 +286,7 @@ func TestStatusLinesStyles(t *testing.T) {
 		testWorkload("aaa", "gpu", "Holder", "running", 5000, 0),
 		testWorkload("bbb", "gpu", "Abandoned", "waiting", 90000, stale),
 	}
+	ws[0].CommandDisplay = "go test ./..."
 	lines := statusLines(ws, testNow, true)
 	for _, tc := range []struct{ text, style, desc string }{
 		{"RESOURCE: gpu", styleBold, "resource heading"},
@@ -247,6 +295,7 @@ func TestStatusLinesStyles(t *testing.T) {
 		{"aaa", styleDim, "workload id"},
 		{"pid 4242", styleDim, "inline pid"},
 		{"[STALE]", styleAlert, "stale marker"},
+		{"go test ./...", styleDim, "command line"},
 	} {
 		got, ok := styleOf(lines, tc.text)
 		if !ok {
@@ -267,9 +316,9 @@ func TestStatusLinesStyles(t *testing.T) {
 // before colour existed.
 func TestStatusLinesPlainTextCarriesNoEscapes(t *testing.T) {
 	ws := []queue.Workload{testWorkload("aaa", "gpu", "Holder", "running", 5000, 0)}
-	for _, compact := range []bool{false, true} {
-		if got := plainText(statusLines(ws, testNow, compact)); strings.Contains(got, "\x1b") {
-			t.Errorf("compact=%v: plain text contains an escape sequence: %q", compact, got)
+	for _, flagStale := range []bool{false, true} {
+		if got := plainText(statusLines(ws, testNow, flagStale)); strings.Contains(got, "\x1b") {
+			t.Errorf("flagStale=%v: plain text contains an escape sequence: %q", flagStale, got)
 		}
 	}
 }
@@ -479,27 +528,38 @@ func TestCompletionLinesShareTheEntryGrid(t *testing.T) {
 	}, testNow, true)
 	done := completionLines([]queue.Completion{
 		testCompletion("bbb", "gpu", "Finished", queue.OutcomeExit, 1, 5000, 0),
-	}, testNow, true, false)
+	}, testNow, false)
 
 	liveEntry, doneEntry := "", ""
+	liveLabel, doneLabel := "", ""
 	for _, l := range plainTexts(live) {
-		if strings.Contains(l, "Holder") {
+		if strings.HasPrefix(l, "  aaa") {
 			liveEntry = l
+		}
+		if strings.Contains(l, "Holder") {
+			liveLabel = l
 		}
 	}
 	for _, l := range plainTexts(done) {
-		if strings.Contains(l, "Finished") {
+		if strings.HasPrefix(l, "  bbb") {
 			doneEntry = l
 		}
+		if strings.Contains(l, "Finished") {
+			doneLabel = l
+		}
 	}
-	want := fmt.Sprintf("  %-8s %-10s %-8s %-2s %-32s", "bbb", "exit 1", "00:05", "", `"Finished"`)
+	want := fmt.Sprintf("  %-8s %-10s %-8s %-2s", "bbb", "exit 1", "00:05", "")
 	if !strings.HasPrefix(doneEntry, want) {
-		t.Fatalf("completion entry = %q, want it to start %q", doneEntry, want)
+		t.Fatalf("completion header = %q, want it to start %q", doneEntry, want)
 	}
-	// The label starts at the same column in both, which is the property
-	// that actually matters on screen.
-	if strings.Index(liveEntry, `"Holder"`) != strings.Index(doneEntry, `"Finished"`) {
-		t.Errorf("label columns differ:\n live %q\n done %q", liveEntry, doneEntry)
+	// Both ran five seconds, so the timer column is directly comparable.
+	if strings.Index(liveEntry, "00:05") != strings.Index(doneEntry, "00:05") {
+		t.Errorf("timer columns differ:\n live %q\n done %q", liveEntry, doneEntry)
+	}
+	// And the labels underneath start at the same column, which is the
+	// property that actually matters on screen.
+	if strings.Index(liveLabel, `"Holder"`) != strings.Index(doneLabel, `"Finished"`) {
+		t.Errorf("label columns differ:\n live %q\n done %q", liveLabel, doneLabel)
 	}
 }
 
@@ -560,7 +620,7 @@ func TestCompletionLinesStyles(t *testing.T) {
 		testCompletion("ccc", "gpu", "Crashed", queue.OutcomeStale, 0, 1000, 0),
 		testCompletion("ddd", "gpu", "Stopped", queue.OutcomeCanceled, 0, 1000, 0),
 	}
-	got := completionLines(cs, testNow, true, false)
+	got := completionLines(cs, testNow, false)
 	for _, tc := range []struct{ text, style string }{
 		{"ok", styleDim},
 		{"exit 1", styleAlert},
@@ -578,11 +638,12 @@ func TestCompletionLinesStyles(t *testing.T) {
 	if style, ok := styleOf(got, completionsHeading); !ok || style != styleDim {
 		t.Errorf("heading style = %q (found %v), want %q", style, ok, styleDim)
 	}
-	// A completion with no label reads the same as a live one with none.
-	if !strings.Contains(plainText(completionLines(
+	// An unlabelled completion spends no line on a placeholder, exactly as
+	// an unlabelled workload does not.
+	if got := plainTexts(completionLines(
 		[]queue.Completion{testCompletion("eee", "gpu", "", queue.OutcomeOK, 0, 0, 0)},
-		testNow, true, false)), `"(no label)"`) {
-		t.Error("an unlabelled completion should render as (no label)")
+		testNow, false)); len(got) != 3 {
+		t.Errorf("an unlabelled completion should be one row, got %q", got)
 	}
 }
 
@@ -593,7 +654,7 @@ func TestCompletionSuffixOrderSurvivesTruncation(t *testing.T) {
 	cs := []queue.Completion{
 		testCompletion("aaa", "gpu", "a fairly long label here", queue.OutcomeExit, 9, 1000, 120000),
 	}
-	full := plainText(completionLines(cs, testNow, true, true))
+	full := plainText(completionLines(cs, testNow, true))
 	res, age := strings.Index(full, "  gpu"), strings.Index(full, "(2m ago)")
 	proj := strings.Index(full, "proj [main]")
 	if res < 0 || age < 0 || proj < 0 {
@@ -604,11 +665,11 @@ func TestCompletionSuffixOrderSurvivesTruncation(t *testing.T) {
 	if !(res < age && age < proj) {
 		t.Fatalf("suffix order = resource %d, age %d, worktree %d:\n%s", res, age, proj, full)
 	}
-	// At 80 columns the worktree is what the truncation takes, while the
+	// Squeezed, the worktree is what the truncation takes, while the
 	// outcome and resource stay.
-	narrow := plainText(fitFrame(completionLines(cs, testNow, true, true), 80, 24))
+	narrow := plainText(fitFrame(completionLines(cs, testNow, true), 55, 24))
 	if !strings.Contains(narrow, "exit 9") || !strings.Contains(narrow, "gpu") {
-		t.Errorf("the outcome and resource must survive an 80-column frame:\n%s", narrow)
+		t.Errorf("the outcome and resource must survive a narrow frame:\n%s", narrow)
 	}
 	if strings.Contains(narrow, "proj [main]") {
 		t.Errorf("the worktree should have been the part dropped:\n%s", narrow)
@@ -617,34 +678,81 @@ func TestCompletionSuffixOrderSurvivesTruncation(t *testing.T) {
 
 func TestCompletionLinesOmitResourceWhenScoped(t *testing.T) {
 	cs := []queue.Completion{testCompletion("aaa", "gpu", "Build", queue.OutcomeOK, 0, 1000, 0)}
-	if got := plainText(completionLines(cs, testNow, true, false)); strings.Contains(got, "gpu") {
+	if got := plainText(completionLines(cs, testNow, false)); strings.Contains(got, "gpu") {
 		t.Errorf("a scoped view should not repeat the resource on every row:\n%s", got)
 	}
-	if got := plainText(completionLines(cs, testNow, true, true)); !strings.Contains(got, "gpu") {
+	if got := plainText(completionLines(cs, testNow, true)); !strings.Contains(got, "gpu") {
 		t.Errorf("an unscoped view needs the resource to attribute a row:\n%s", got)
 	}
 }
 
-func TestCompletionLinesNonCompactUsesContinuationLines(t *testing.T) {
+// A completion stacks exactly like a live entry: header, label, command.
+func TestCompletionStacksHeaderLabelAndCommand(t *testing.T) {
+	c := testCompletion("aaa", "gpu", "Build", queue.OutcomeOK, 0, 1000, 0)
+	c.CommandDisplay = "make all"
+	got := plainTexts(completionLines([]queue.Completion{c}, testNow, false))
+	if len(got) != 5 {
+		t.Fatalf("expected blank, heading, header, label and command; got %d lines: %q", len(got), got)
+	}
+	if !strings.HasPrefix(got[2], "  aaa") || strings.Contains(got[2], "Build") {
+		t.Errorf("header row = %q, want the columns without the label", got[2])
+	}
+	if want := continuationIndent + `"Build"`; got[3] != want {
+		t.Errorf("label line = %q, want %q", got[3], want)
+	}
+	if want := continuationIndent + "make all"; got[4] != want {
+		t.Errorf("command line = %q, want %q", got[4], want)
+	}
+	// No row may leave trailing whitespace behind.
+	for _, l := range got[2:] {
+		if strings.TrimRight(l, " ") != l {
+			t.Errorf("row has trailing whitespace: %q", l)
+		}
+	}
+}
+
+// A completion recorded before the command column existed reads back empty,
+// and renders the one line it always did rather than a blank continuation.
+func TestCompletionWithoutACommandKeepsItsOldShape(t *testing.T) {
 	got := plainTexts(completionLines([]queue.Completion{
 		testCompletion("aaa", "gpu", "Build", queue.OutcomeOK, 0, 1000, 0),
-	}, testNow, false, false))
+	}, testNow, false))
 	if len(got) != 4 {
-		t.Fatalf("expected blank, heading, entry and continuation; got %d lines: %q", len(got), got)
+		t.Fatalf("expected blank, heading, header and label; got %d lines: %q", len(got), got)
 	}
-	if !strings.HasPrefix(got[3], entryIndent+"project: ") {
-		t.Errorf("continuation line = %q, want the project under the label", got[3])
+	if want := continuationIndent + `"Build"`; got[3] != want {
+		t.Errorf("label line = %q, want %q", got[3], want)
 	}
-	// The status layout must not leave trailing whitespace on the entry.
-	if strings.TrimRight(got[2], " ") != got[2] {
-		t.Errorf("entry line has trailing whitespace: %q", got[2])
+}
+
+// And a finished entry sits on the same lines as a live one, which is what
+// keeps a monitor frame reading as a single table.
+func TestLiveAndFinishedEntriesStackAlike(t *testing.T) {
+	w := testWorkload("aaa", "gpu", "Holder", "running", 5000, 0)
+	w.CommandDisplay = "make all"
+	c := testCompletion("bbb", "gpu", "Holder", queue.OutcomeOK, 0, 5000, 0)
+	c.CommandDisplay = "make all"
+
+	continuations := func(lines []line) []string {
+		var out []string
+		for _, l := range plainTexts(lines) {
+			if strings.HasPrefix(l, continuationIndent) {
+				out = append(out, l)
+			}
+		}
+		return out
+	}
+	live := continuations(statusLines([]queue.Workload{w}, testNow, true))
+	done := continuations(completionLines([]queue.Completion{c}, testNow, false))
+	if strings.Join(live, "|") != strings.Join(done, "|") {
+		t.Errorf("continuations differ:\n live %q\n done %q", live, done)
 	}
 }
 
 // TestCompletionLinesReportAnEmptyRing covers the difference between the two
 // callers: status was asked for the section by name, so it gets an answer.
 func TestCompletionLinesReportAnEmptyRing(t *testing.T) {
-	got := plainText(completionLines(nil, testNow, false, false))
+	got := plainText(completionLines(nil, testNow, false))
 	if !strings.Contains(got, completionsHeading) || !strings.Contains(got, "(none recorded)") {
 		t.Errorf("an empty ring should still answer:\n%s", got)
 	}

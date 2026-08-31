@@ -136,6 +136,7 @@ type Completion struct {
 	WorkingDirectory string
 	RepositoryRoot   string
 	GitBranch        string
+	CommandDisplay   string
 }
 
 // Tuning for the completions ring. These are variables so tests can shorten
@@ -534,16 +535,17 @@ func Release(d *sql.DB, w *Workload, out Outcome) error {
 	defer tx.Rollback()
 
 	var (
-		label, wd, root, branch string
-		acquiredAt              sql.NullInt64
+		label, wd, root, branch, command string
+		acquiredAt                       sql.NullInt64
 	)
 	// QueryRow, not Query: with a single connection, executing the INSERT
 	// below while a RETURNING result set is still open would deadlock.
 	err = tx.QueryRow(`
 		DELETE FROM workloads WHERE id = ?
 		RETURNING IFNULL(label,''), acquired_at, IFNULL(working_directory,''),
-		          IFNULL(repository_root,''), IFNULL(git_branch,'')`, w.ID).
-		Scan(&label, &acquiredAt, &wd, &root, &branch)
+		          IFNULL(repository_root,''), IFNULL(git_branch,''),
+		          IFNULL(command_display,'')`, w.ID).
+		Scan(&label, &acquiredAt, &wd, &root, &branch, &command)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		// Another process already reclaimed the row as stale, and recorded
@@ -563,6 +565,7 @@ func Release(d *sql.DB, w *Workload, out Outcome) error {
 		Outcome: out.Kind, ExitCode: int64(out.ExitCode),
 		StartedAt: acquiredAt.Int64, FinishedAt: now,
 		WorkingDirectory: wd, RepositoryRoot: root, GitBranch: branch,
+		CommandDisplay: command,
 	}, now); err != nil {
 		return err
 	}
@@ -584,10 +587,11 @@ func recordCompletionTx(tx *sql.Tx, c Completion, now int64) error {
 	if _, err := tx.Exec(`
 		INSERT INTO completions
 			(id, resource, label, outcome, exit_code, started_at, finished_at,
-			 working_directory, repository_root, git_branch)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 working_directory, repository_root, git_branch, command_display)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		c.ID, c.Resource, c.Label, c.Outcome, c.ExitCode, c.StartedAt, c.FinishedAt,
-		c.WorkingDirectory, c.RepositoryRoot, c.GitBranch); err != nil {
+		c.WorkingDirectory, c.RepositoryRoot, c.GitBranch,
+		c.CommandDisplay); err != nil {
 		return fmt.Errorf("recording completion: %w", err)
 	}
 	// Count cap, scoped to the resource just written. The subselect yields
@@ -620,7 +624,8 @@ func RecentCompletions(d *sql.DB, resource string, limit int) ([]Completion, err
 	}
 	q := `SELECT seq, id, resource, IFNULL(label,''), outcome, exit_code,
 	             started_at, finished_at, IFNULL(working_directory,''),
-	             IFNULL(repository_root,''), IFNULL(git_branch,'')
+	             IFNULL(repository_root,''), IFNULL(git_branch,''),
+	             IFNULL(command_display,'')
 	      FROM completions`
 	var args []any
 	if resource != "" {
@@ -639,7 +644,8 @@ func RecentCompletions(d *sql.DB, resource string, limit int) ([]Completion, err
 		var c Completion
 		if err := rows.Scan(&c.Seq, &c.ID, &c.Resource, &c.Label, &c.Outcome,
 			&c.ExitCode, &c.StartedAt, &c.FinishedAt,
-			&c.WorkingDirectory, &c.RepositoryRoot, &c.GitBranch); err != nil {
+			&c.WorkingDirectory, &c.RepositoryRoot, &c.GitBranch,
+			&c.CommandDisplay); err != nil {
 			return nil, fmt.Errorf("reading completion row: %w", err)
 		}
 		out = append(out, c)
@@ -693,7 +699,7 @@ func takeStaleTx(tx *sql.Tx, resource string, now int64) ([]StaleRemoved, []Comp
 	cutoff := now - StaleThreshold.Milliseconds()
 	const cols = ` RETURNING id, resource, state, IFNULL(label,''), IFNULL(acquired_at,0),
 	          IFNULL(working_directory,''), IFNULL(repository_root,''),
-	          IFNULL(git_branch,'')`
+	          IFNULL(git_branch,''), IFNULL(command_display,'')`
 	q := `DELETE FROM workloads WHERE heartbeat_at < ?` + cols
 	args := []any{cutoff}
 	if resource != "" {
@@ -711,7 +717,8 @@ func takeStaleTx(tx *sql.Tx, resource string, now int64) ([]StaleRemoved, []Comp
 		var r StaleRemoved
 		var c Completion
 		if err := rows.Scan(&r.ID, &r.Resource, &r.State, &c.Label, &c.StartedAt,
-			&c.WorkingDirectory, &c.RepositoryRoot, &c.GitBranch); err != nil {
+			&c.WorkingDirectory, &c.RepositoryRoot, &c.GitBranch,
+			&c.CommandDisplay); err != nil {
 			return nil, nil, fmt.Errorf("reading stale workload row: %w", err)
 		}
 		removed = append(removed, r)

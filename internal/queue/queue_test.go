@@ -373,6 +373,7 @@ func TestReleaseRecordsCompletion(t *testing.T) {
 	w, err := Enqueue(d, "gpu", PriorityDefault, Meta{
 		Label: "build wheels", PID: 4321,
 		WorkingDirectory: "/src/proj", RepositoryRoot: "/src/proj", GitBranch: "feature-x",
+		CommandDisplay: "make wheels -j8",
 	})
 	if err != nil {
 		t.Fatalf("enqueue: %v", err)
@@ -400,6 +401,11 @@ func TestReleaseRecordsCompletion(t *testing.T) {
 	if c.RepositoryRoot != "/src/proj" || c.WorkingDirectory != "/src/proj" || c.GitBranch != "feature-x" {
 		t.Errorf("context = %q/%q/%q, want /src/proj, /src/proj, feature-x",
 			c.RepositoryRoot, c.WorkingDirectory, c.GitBranch)
+	}
+	// The command comes off the deleted row for the same reason, and is what
+	// the LAST COMPLETED section shows under a finished entry.
+	if c.CommandDisplay != "make wheels -j8" {
+		t.Errorf("command = %q, want %q", c.CommandDisplay, "make wheels -j8")
 	}
 	if c.StartedAt != w.AcquiredAt {
 		t.Errorf("started_at = %d, want the acquisition time %d", c.StartedAt, w.AcquiredAt)
@@ -448,7 +454,12 @@ func TestReleaseRecordsAtMostOnce(t *testing.T) {
 
 func TestStaleRunningWorkloadIsRecordedAsStale(t *testing.T) {
 	d, _ := testDB(t)
-	a := enqueue(t, d, "gpu")
+	a, err := Enqueue(d, "gpu", PriorityDefault, Meta{
+		Label: "doomed", PID: 1234, CommandDisplay: "sleep 900",
+	})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
 	mustAcquire(t, d, a)
 	backdateHeartbeat(t, d, a, 2*StaleThreshold)
 	if _, err := CleanupStale(d, ""); err != nil {
@@ -460,6 +471,11 @@ func TestStaleRunningWorkloadIsRecordedAsStale(t *testing.T) {
 	}
 	if got[0].Outcome != OutcomeStale || got[0].ID != a.ID {
 		t.Errorf("completion = %s/%s, want %s/stale", got[0].ID, got[0].Outcome, a.ID)
+	}
+	// Nobody was there to release this one, so the reclaim path is the only
+	// thing that can preserve what it was running.
+	if got[0].CommandDisplay != "sleep 900" {
+		t.Errorf("reclaimed command = %q, want %q", got[0].CommandDisplay, "sleep 900")
 	}
 }
 

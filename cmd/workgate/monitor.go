@@ -22,8 +22,10 @@ const (
 	// How many recent completions the monitor shows. Fixed rather than a
 	// flag: the frame has a fixed height, so a larger number would push the
 	// live queue — the thing the monitor exists for — into the overflow
-	// counter. --interval is a flag because there is no right refresh rate;
-	// three is a fine answer here.
+	// counter. A completion now costs up to three lines, the same as a live
+	// entry, which is a reason to keep the number small rather than to
+	// change it. --interval is a flag because there is no right refresh
+	// rate; three is a fine answer here.
 	monitorRecentCount = 3
 	// How long a notice about a keystroke stays on screen. Long enough to
 	// read, short enough that a monitor left alone goes back to being only the
@@ -327,7 +329,7 @@ func monitorBody(workloads []queue.Workload, done []queue.Completion, resource s
 	// Unlike status --recent, the monitor was not asked for this section by
 	// name, so an empty ring shows nothing rather than "(none recorded)".
 	if len(done) > 0 {
-		out = append(out, completionLines(done, now, true, resource == "")...)
+		out = append(out, completionLines(done, now, resource == "")...)
 	}
 	return out
 }

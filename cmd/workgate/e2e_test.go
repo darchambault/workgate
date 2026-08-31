@@ -459,6 +459,17 @@ func TestMonitorRendersLiveQueue(t *testing.T) {
 			t.Errorf("monitor output missing %q:\n%s", want, text)
 		}
 	}
+	// The command is recorded at enqueue and shown on a line of its own, which
+	// is the whole reason an entry is worth more than one line.
+	if !strings.Contains(text, "-sleep 20s") {
+		t.Errorf("monitor output missing the command:\n%s", text)
+	}
+	// And the label is under the header row rather than sharing it.
+	for _, l := range strings.Split(text, "\n") {
+		if strings.Contains(l, "Held workload") && strings.Contains(l, "pid ") {
+			t.Errorf("the label should not share the header row: %q", l)
+		}
+	}
 	// The non-TTY path must stay pipe-friendly.
 	if strings.Contains(text, "\x1b[") {
 		t.Errorf("monitor emitted escape sequences to a pipe:\n%q", text)
@@ -529,8 +540,11 @@ func TestStatusShowsRecentCompletions(t *testing.T) {
 	}
 
 	text := runStatus(t, dir, env, "recent-res", "--recent")
+	// The command survives the workload row it was recorded on: the row is
+	// deleted at release, and the completion is written from it in the same
+	// transaction.
 	for _, want := range []string{"LAST COMPLETED", "exit 3", "Second workload",
-		"First workload", "(just now)", "ok"} {
+		"First workload", "(just now)", "ok", "-exit 3"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("status --recent output missing %q:\n%s", want, text)
 		}
