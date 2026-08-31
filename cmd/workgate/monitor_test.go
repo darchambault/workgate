@@ -281,10 +281,10 @@ func TestStatusLinesEmpty(t *testing.T) {
 }
 
 func TestMonitorBodyEmptyStates(t *testing.T) {
-	if got := monitorBody(nil, nil, "", testNow); !strings.Contains(got[0].plain(), "No active workgate workloads.") {
+	if got := monitorBody(nil, nil, "", testNow, ""); !strings.Contains(got[0].plain(), "No active workgate workloads.") {
 		t.Errorf("all-resources empty message = %q", got[0].plain())
 	}
-	if got := monitorBody(nil, nil, "gpu", testNow); !strings.Contains(got[0].plain(), `"gpu"`) {
+	if got := monitorBody(nil, nil, "gpu", testNow, ""); !strings.Contains(got[0].plain(), `"gpu"`) {
 		t.Errorf("single-resource empty message should name the resource, got %q", got[0].plain())
 	}
 }
@@ -293,7 +293,8 @@ func TestMonitorBodyEmptyStates(t *testing.T) {
 // with a warning appended.
 func TestMonitorFrameKeepsBodyOnReadError(t *testing.T) {
 	body := []line{plainLine("RESOURCE: gpu"), plainLine("RUNNING"), plainLine(`  aaa  "Holder"  00:05`)}
-	frame := monitorFrame("gpu", body, errors.New("database is locked"), time.Second, time.Now())
+	frame := monitorFrame(body, frameState{scope: "gpu", readErr: errors.New("database is locked"),
+		interval: time.Second, now: time.Now()})
 	text := plainText(frame)
 	for _, want := range []string{"workgate monitor - gpu", `"Holder"`,
 		"warning: last refresh failed: database is locked", "Ctrl+C to stop"} {
@@ -307,7 +308,8 @@ func TestMonitorFrameKeepsBodyOnReadError(t *testing.T) {
 }
 
 func TestMonitorFrameShowsInterval(t *testing.T) {
-	frame := monitorFrame("all resources", []line{plainLine("x")}, nil, 2500*time.Millisecond, time.Now())
+	frame := monitorFrame([]line{plainLine("x")}, frameState{scope: "all resources",
+		interval: 2500 * time.Millisecond, now: time.Now()})
 	last := frame[len(frame)-1]
 	if !strings.Contains(last.plain(), "refreshing every 2.5s") {
 		t.Errorf("footer should state the interval: %q", last.plain())
@@ -319,7 +321,8 @@ func TestMonitorFrameShowsInterval(t *testing.T) {
 
 // The header and footer are chrome; the queue is the content.
 func TestMonitorFrameDimsChrome(t *testing.T) {
-	frame := monitorFrame("gpu", []line{plainLine("body")}, nil, time.Second, time.Now())
+	frame := monitorFrame([]line{plainLine("body")}, frameState{scope: "gpu",
+		interval: time.Second, now: time.Now()})
 	if frame[0][0].style != styleDim {
 		t.Errorf("header style = %q, want dim", frame[0][0].style)
 	}
@@ -651,7 +654,7 @@ func TestCompletionLinesReportAnEmptyRing(t *testing.T) {
 // is most useful in: nothing is running, and the question is what finished.
 func TestMonitorBodyShowsCompletionsWithAnEmptyQueue(t *testing.T) {
 	done := []queue.Completion{testCompletion("aaa", "gpu", "Build", queue.OutcomeOK, 0, 1000, 0)}
-	got := plainText(monitorBody(nil, done, "", testNow))
+	got := plainText(monitorBody(nil, done, "", testNow, ""))
 	if !strings.Contains(got, "No active workgate workloads.") {
 		t.Errorf("the empty-queue message should remain:\n%s", got)
 	}
@@ -663,7 +666,7 @@ func TestMonitorBodyShowsCompletionsWithAnEmptyQueue(t *testing.T) {
 func TestMonitorBodyOmitsTheSectionWhenThereAreNoCompletions(t *testing.T) {
 	got := plainTexts(monitorBody([]queue.Workload{
 		testWorkload("aaa", "gpu", "Holder", "running", 5000, 0),
-	}, nil, "gpu", testNow))
+	}, nil, "gpu", testNow, ""))
 	for _, l := range got {
 		if strings.Contains(l, completionsHeading) {
 			t.Fatalf("the monitor was not asked for the section by name:\n%s", strings.Join(got, "\n"))
@@ -749,7 +752,7 @@ func TestCompletionsAreDroppedBeforeTheLiveQueue(t *testing.T) {
 	done := []queue.Completion{
 		testCompletion("ccc", "gpu", "Finished", queue.OutcomeOK, 0, 1000, 0),
 	}
-	body := monitorBody(ws, done, "gpu", testNow)
+	body := monitorBody(ws, done, "gpu", testNow, "")
 	if !strings.Contains(plainText(body), "Finished") {
 		t.Fatalf("the section should be present before fitting:\n%s", plainText(body))
 	}

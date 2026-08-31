@@ -43,7 +43,8 @@ that is already running. "priority" re-prioritizes a workload that is already
 queued, whichever session started it; take the id from "workgate status".
 
 "monitor" is "status" as a live, full-screen view: it redraws once per
-second until interrupted with Ctrl+C, and never modifies the queue.
+second until stopped with q or Ctrl+C. On a terminal, up/down select a
+waiting workload and right/left raise and lower its priority.
 
 "--recent" appends the last few workloads that finished, with how each one
 ended; the monitor always shows them.
@@ -380,6 +381,14 @@ func isDigits(s string) bool {
 // they are unwanted — status prints line.plain(), and the monitor drops them
 // when stdout is redirected or NO_COLOR is set.
 func statusLines(workloads []queue.Workload, now int64, compact bool) []line {
+	return selectedStatusLines(workloads, now, compact, "")
+}
+
+// selectedStatusLines is statusLines with the monitor's highlight: the entry
+// whose id is selected opens with a marker instead of the usual blank gutter.
+// An empty selection renders exactly what statusLines renders, which is what
+// `status` wants — it prints one frame and has nothing to select with.
+func selectedStatusLines(workloads []queue.Workload, now int64, compact bool, selected string) []line {
 	byResource := map[string][]queue.Workload{}
 	var order []string
 	for _, w := range workloads {
@@ -414,6 +423,9 @@ func statusLines(workloads []queue.Workload, now int64, compact bool) []line {
 			entry := entryLine(w.ID, pidSpan(w.PID),
 				fmtElapsed(time.Duration(now-since)*time.Millisecond), w.Label,
 				w.Priority, compact)
+			if selected != "" && w.ID == selected {
+				entry[0] = span{text: rowGutterSelected, style: styleBold}
+			}
 			if !compact {
 				out = append(out, entry)
 				if p := displayContext(w); p != "" {
@@ -535,7 +547,7 @@ func entryLine(id string, col2 span, timer, label string, priority int, padLabel
 		labelText = fmt.Sprintf("%-*s", labelWidth, clampWidth(labelText, labelWidth))
 	}
 	return line{
-		{text: "  "},
+		{text: rowGutter},
 		{text: fmt.Sprintf("%-*s", idWidth, id), style: styleDim},
 		{text: " "},
 		col2,
@@ -613,6 +625,16 @@ func fmtAgo(d time.Duration) string {
 		return fmt.Sprintf("(%dd ago)", int(d.Hours())/24)
 	}
 }
+
+// The two columns every entry line opens with. The selected row spends them on
+// a marker instead of blank space: the highlight has to read on a terminal
+// with colour disabled, so the text carries it and the style is only ever a
+// second channel. Two columns either way, so the grid holds and a selected
+// row's label sits exactly where an unselected one's does.
+const (
+	rowGutter         = "  "
+	rowGutterSelected = "> "
+)
 
 // Column widths for an entry line:
 // "  <id> <pid-or-outcome> <timer> <priority> <label>".

@@ -463,6 +463,11 @@ func TestMonitorRendersLiveQueue(t *testing.T) {
 	if strings.Contains(text, "\x1b[") {
 		t.Errorf("monitor emitted escape sequences to a pipe:\n%q", text)
 	}
+	// Keys are offered only on a terminal. A piped monitor must not advertise
+	// them, which is the same condition that keeps it unable to mutate anything.
+	if strings.Contains(text, "up/down select") {
+		t.Errorf("monitor offered keys on a pipe:\n%s", text)
+	}
 	// Monitoring is read-only: both workloads must still be queued.
 	if ws := listState(t, d, "monitor-res"); len(ws) != 2 {
 		t.Errorf("monitor changed the queue: %d workloads remain, want 2", len(ws))

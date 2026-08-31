@@ -39,7 +39,8 @@ workgate priority <id> <1-5>
   decides who runs next.
 - `priority` re-prioritizes a workload that is already queued, whichever
   session started it. The id is the first column of `status`.
-- `monitor` is `status` as a live view; see [Monitoring](#monitoring) below.
+- `monitor` is `status` as a live view, and the one place a queue can be
+  re-ordered by hand; see [Monitoring](#monitoring) below.
 - `--recent` appends the last few workloads that finished, and how each one
   ended; see [Recent completions](#recent-completions). `monitor` always shows
   them. Without the flag, `status` output is unchanged.
@@ -116,8 +117,10 @@ else has to speak for it:
 ### Monitoring
 
 `workgate monitor` is the same information as a live view: it takes over the
-terminal, redraws once per second, and runs until you stop it with Ctrl+C.
-Use it to watch a contended resource instead of re-running `status` in a loop.
+terminal, redraws once per second, and runs until you stop it with `q` or
+Ctrl+C. Use it to watch a contended resource instead of re-running `status` in
+a loop — and, on a terminal, to re-prioritize a waiting workload with the arrow
+keys, without leaving the view that shows why it needs it.
 
 ```text
 workgate monitor [<resource>] [--interval <duration>]
@@ -132,7 +135,7 @@ RUNNING
   49ce3e   pid 77900  00:04    P3 "Workload-A"                      MyApp [main]
 
 WAITING
-  1eabb7   pid 64732  00:02    P1 "Urgent hotfix run"               MyApp [hotfix]
+> 1eabb7   pid 64732  00:02    P1 "Urgent hotfix run"               MyApp [hotfix]
   70ce62   pid 51204  00:31    P3 "Workload-B"                      MyApp [fix-42]
 
 LAST COMPLETED
@@ -140,7 +143,7 @@ LAST COMPLETED
   7f2a90   exit 1     00:00       "Workload-Y"                      (2m ago)    MyApp [fix-42]
   3c4d5e   stale      00:31       "Workload-X"                      (18m ago)   Other [main]
 
-refreshing every 1s - Ctrl+C to stop
+refreshing every 1s - up/down select - right raises priority - q to stop
 ```
 
 - Without a resource it watches every resource, grouped, exactly as `status`
@@ -151,27 +154,48 @@ refreshing every 1s - Ctrl+C to stop
   Resizing the window mid-run is fine — each frame is re-fitted, and a window
   too short for the whole queue ends with a count of what did not fit rather
   than dropping it silently.
-- **Monitoring never modifies the queue.** Unlike `status`, it does not remove
-  abandoned workloads; it labels them `[STALE]` and leaves them to the next
-  `run` or `status`. Watching a resource should not change who owns it. (The
-  database is still opened normally, which applies the idempotent
-  `CREATE TABLE IF NOT EXISTS` schema step and, once on a database that
-  predates priorities, the `ALTER TABLE` that adds the column — "read-only"
-  means no queue mutation, not zero writes.)
+- **Monitoring never removes a workload.** Unlike `status`, it does not reclaim
+  abandoned ones; it labels them `[STALE]` and leaves them to the next `run` or
+  `status`. Watching a resource should not change who owns it. The only thing a
+  monitor writes is a priority, for the row you selected and only on the
+  keystroke that asks for it. (The database is still opened normally, which
+  applies the idempotent `CREATE TABLE IF NOT EXISTS` schema step and, once on a
+  database that predates priorities, the `ALTER TABLE` that adds the column — so
+  even an untouched monitor is not literally zero writes.)
+- **The keys are four arrows and `q`.** Up and down move the highlight through
+  the waiting workloads; right raises the selected one's priority and left
+  lowers it, clamped at 1 and 5. `j`/`k`/`h`/`l` do the same, Esc drops the
+  selection, and `q` stops the monitor. Each keystroke redraws at once, so a row
+  moves as you promote it.
+  - The selection follows the **workload**, not the position: the row you
+    promoted stays highlighted where it lands. Moving past the top or the bottom
+    stops there and leaves nothing selected, and the same key steps back on.
+  - The running workload is not selectable. It already holds the resource, and
+    workgate never preempts, so its level has nothing left to decide. Use
+    `workgate priority` if you want to set one anyway.
+  - A selected workload that finishes takes the highlight with it, rather than
+    leaving it on whichever row inherited the place.
+  - Keys need a terminal at **both** ends. With stdin or stdout redirected, or
+    on a console too old for virtual terminal input, the monitor is silently the
+    read-only view it has always been — the footer only offers keys that work.
 - A finished workload leaves the priority column blank: its level described a
   queue it has already left. The column is still spent, so live and finished
   rows stay on one grid.
 - Restrained colour picks out the structure: section headings (green for
   RUNNING, yellow for WAITING), a red `[STALE]` and a red failing outcome,
   and dimmed chrome so the eye lands on the workloads. Colour is never the
-  only signal — every state it distinguishes is also written out — and setting
-  `NO_COLOR` to any value turns it off while keeping the live redraw.
+  only signal: every state it distinguishes is also written out, and the
+  selected row is marked with a literal `>` in the two columns every row
+  already spends on its indent. Setting `NO_COLOR` to any value turns colour
+  off while keeping the live redraw.
 - Redirected output (`workgate monitor gpu | tee watch.log`) emits no escape
   sequences at all: frames are simply appended, one per interval, unstyled
   and untruncated.
-- Ctrl+C is how a monitor is meant to end, so it exits `0`. The `130`
-  interrupted code listed above belongs to `run`, where an interrupt cuts a
-  child command short.
+- `q` and Ctrl+C are both how a monitor is meant to end, so it exits `0`. The
+  `130` interrupted code listed above belongs to `run`, where an interrupt cuts
+  a child command short. Ctrl+C keeps working in the interactive view because
+  the monitor takes the keyboard in cbreak mode rather than raw mode: it reads
+  keys unbuffered and unechoed, and deliberately leaves the interrupt alone.
 
 ### Recent completions
 
@@ -201,7 +225,7 @@ LAST COMPLETED
   `canceled` (interrupted mid-run), and `stale` (the owner stopped
   heartbeating and was reclaimed). Everything that held the resource is
   recorded, so a hard-killed workload leaves a trace rather than vanishing —
-  though, since `monitor` never modifies the queue, such a workload reads
+  though, since `monitor` never removes a row, such a workload reads
   `[STALE]` in the live section until the next `run` or `status` reclaims it
   and moves it down here.
 - `monitor` always shows three. `status` shows none unless asked: `--recent`
@@ -363,9 +387,9 @@ Tips for adapting the snippet:
   operation — not one per shell command inside it, and not a whole
   multi-step task that only briefly needs the resource.
 - **Point agents at `status`, not `monitor`.** `monitor` runs until
-  interrupted, so an agent that starts one never gets its command back.
-  It is a human's window onto the queue; `workgate status <resource>` is
-  the one-shot form an agent should use.
+  interrupted, so an agent that starts one never gets its command back, and
+  its keys are for a pair of hands. It is a human's window onto the queue;
+  `workgate status <resource>` is the one-shot form an agent should use.
 
 ## How it works
 
@@ -492,9 +516,11 @@ Tests include multi-process end-to-end coverage (ordering across real
 processes, priority overtaking and live re-prioritization,
 hard-kill recovery, exit-code propagation, and completions surviving both a
 clean exit and a hard kill). `monitor` is covered through its
-redirected-output path, and its escape sequences are asserted directly; the
-alternate-screen view itself needs a real console, so changes to it are worth
-running by eye. Environment variables
+redirected-output path, and its escape sequences are asserted directly; key
+decoding, selection movement and the priority keystroke are unit-tested, the
+last against a real database. The alternate-screen view itself needs a real
+console, and so does putting the keyboard into cbreak mode, so changes to
+either are worth running by eye. Environment variables
 `WORKGATE_DB`, `WORKGATE_HEARTBEAT_INTERVAL_MS`, `WORKGATE_STALE_THRESHOLD_MS`
 and `WORKGATE_POLL_INTERVAL_MS` exist solely so tests can isolate state and
 shorten timings; they are not user-facing configuration.
@@ -518,9 +544,10 @@ shorten timings; they are not user-facing configuration.
 - Waiting uses sub-second polling rather than event-driven wakeup; the
   database traffic involved is negligible.
 - Killing `monitor` outright (`SIGKILL`, `taskkill /F`) skips its cleanup and
-  leaves the terminal on the alternate screen with the cursor hidden. Ctrl+C
-  and, on macOS/Linux, `SIGTERM`/`SIGHUP` are all handled and restore it; a
-  terminal stranded by a hard kill is recovered with `reset` on macOS/Linux,
+  leaves the terminal on the alternate screen with the cursor hidden and, if it
+  had taken the keyboard, without echo or line editing. `q`, Ctrl+C and, on
+  macOS/Linux, `SIGTERM`/`SIGHUP` are all handled and restore every part of it;
+  a terminal stranded by a hard kill is recovered with `reset` on macOS/Linux,
   or by opening a new tab on Windows.
 - Priorities are strict and small: five levels, arrival order within a level,
   and no aging. A low-priority workload behind a steady supply of

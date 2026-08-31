@@ -2,8 +2,11 @@
 //
 // Only the handful of escape sequences a full-screen redraw needs are used,
 // so no terminal library is pulled in. Platform specifics — enabling virtual
-// terminal processing on Windows, reading the window size — live in
-// term_windows.go and term_unix.go, following the same split as signals_*.go.
+// terminal processing on Windows, reading the window size, putting the
+// keyboard into cbreak mode — live in term_windows.go and term_unix.go (with
+// term_unix_bsd.go and term_unix_other.go carrying the one pair of constants
+// that differs between unixes), following the same split as signals_*.go.
+// Key decoding itself is portable and lives in keys.go.
 package main
 
 import (
