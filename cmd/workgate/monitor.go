@@ -61,6 +61,12 @@ func cmdMonitor(args []string) int {
 		}
 	}
 
+	// Unlike status, the monitor cannot say this on stderr: the alternate
+	// screen goes up a few lines below and takes the message with it. It is
+	// carried into every frame instead, next to the refresh warning, because
+	// a monitor is watched for hours and a notice it never sees is no notice.
+	configErr := loadDisplayConfig()
+
 	path, err := db.Path()
 	if err != nil {
 		return fail(err)
@@ -112,12 +118,13 @@ func cmdMonitor(args []string) int {
 		}
 		now := time.Now()
 		if err := sc.draw(monitorFrame(body, frameState{
-			scope:    scope,
-			readErr:  listErr,
-			notice:   st.noticeAt(now),
-			keys:     kr.enabled,
-			interval: interval,
-			now:      now,
+			scope:     scope,
+			readErr:   listErr,
+			configErr: configErr,
+			notice:    st.noticeAt(now),
+			keys:      kr.enabled,
+			interval:  interval,
+			now:       now,
 		})); err != nil {
 			// Almost always a closed pipe (`| head`); nothing to report.
 			return 0
@@ -338,12 +345,17 @@ func monitorBody(workloads []queue.Workload, done []queue.Completion, resource s
 // A struct rather than more parameters: they are all chrome, and a caller
 // passing seven positional arguments would be the harder thing to read.
 type frameState struct {
-	scope    string
-	readErr  error
-	notice   string
-	keys     bool // key input is live, so the footer says what the keys do
-	interval time.Duration
-	now      time.Time
+	scope   string
+	readErr error
+	// configErr is fixed for the life of the monitor, where readErr comes
+	// and goes with each refresh. It is still per-frame rather than drawn
+	// once at startup: the alternate screen is redrawn whole every tick, so
+	// anything printed before the loop is gone by the first frame.
+	configErr error
+	notice    string
+	keys      bool // key input is live, so the footer says what the keys do
+	interval  time.Duration
+	now       time.Time
 }
 
 // monitorFrame assembles one frame from the most recent successful read. A
@@ -366,6 +378,15 @@ func monitorFrame(body []line, st frameState) []line {
 	if st.readErr != nil {
 		frame = append(frame,
 			styledLine(styleAlert, fmt.Sprintf("warning: last refresh failed: %v", st.readErr)),
+			plainLine(""))
+	}
+	// Above the keystroke notice, and below the refresh warning. This one
+	// stands for the whole session — the file is read once, so fixing it
+	// takes effect on the next monitor — which is precisely why it should
+	// not be the line that pushes a transient message off screen.
+	if st.configErr != nil {
+		frame = append(frame,
+			styledLine(styleAlert, fmt.Sprintf("warning: %v", st.configErr)),
 			plainLine(""))
 	}
 	// What a keystroke did, in the frame rather than on stderr, which would

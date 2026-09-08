@@ -8,7 +8,8 @@ terminals) — across different projects, Git repositories, and worktrees on the
 same machine (Windows, macOS, or Linux) — serialize workloads that need
 exclusive access to a shared machine-level resource (e.g. a GPU, a hardware
 test rig, a licensed toolchain seat). It is a small local coordination
-primitive, not a job scheduler: no daemon, no server, no configuration.
+primitive, not a job scheduler: no daemon, no server, and nothing to
+configure before it works.
 
 ```sh
 workgate run gpu --label "Run integration tests" -- test-runner --suite integration
@@ -53,6 +54,9 @@ workgate priority <id> <1-5>
   stdout stays clean for piping. `priority` confirms itself on stderr for the
   same reason. `status` and `monitor` are output in their own right and write
   to **stdout**.
+- There is nothing to configure to use any of this. An optional file can
+  shorten the long install roots those two views print; see
+  [Configuration](#configuration).
 
 Typical output:
 
@@ -270,6 +274,84 @@ LAST COMPLETED
 - This is a bounded ring, not history: at most ten completions per resource,
   expiring after a day, with nothing to query them beyond the last few. See
   [Scope](#scope).
+
+## Configuration
+
+Workgate needs no configuration, and has none until you write a file. That
+file is read only by `status` and `monitor`, and only to decide how commands
+are printed — nothing in it reaches the queue, so two sessions with different
+files still contend for a resource identically. It lives in the platform's
+per-user config directory, which you create yourself:
+
+```text
+Windows   %APPDATA%\Workgate\config.yaml
+macOS     ~/Library/Application Support/Workgate/config.yaml
+Linux     $XDG_CONFIG_HOME/Workgate/config.yaml   (default ~/.config/...)
+```
+
+Deliberately not the cache directory the database lives in: a cache is
+disposable and may be swept at any time, and this is a file you wrote.
+
+### Shortening displayed commands
+
+An entry shows the command on a line of its own, and on a real machine most of
+that line is the same install root over and over — a toolchain directory, a
+virtualenv, the parent every agent worktree hangs off. `strip-prefixes` names
+those roots, and the views drop them:
+
+```yaml
+display:
+  strip-prefixes:
+    - C:\Users\you\AppData\Local\Programs\Python\Python312\
+    - D:\Projects\
+```
+
+```text
+> workgate status gpu
+RESOURCE: gpu
+
+RUNNING
+  b0d41c   pid 24196  04:12    P2   ml-service [train-v3]
+           "Fine-tune the reranker"
+           python.exe train.py --config configs/rerank.yaml
+```
+
+instead of the same entry running out to
+`C:\Users\you\AppData\Local\Programs\Python\Python312\python.exe`, whose
+interesting half a narrow terminal never reaches.
+
+- A prefix is removed **everywhere it appears**, not only at the front. A
+  command routinely names one root twice — once for the program, once for the
+  file it is given — and shortening only the first leaves the line as long as
+  it was.
+- A trailing separator is supplied if you leave it off, so `D:\Projects` and
+  `D:\Projects\` mean the same thing. Without it the command would start on a
+  bare separator, which reads like a path from the root of the drive and is
+  not one.
+- Where two prefixes overlap, the longer one wins on each occurrence, whatever
+  order the file lists them in.
+- On Windows, matching follows Windows' own path rules: ASCII case is ignored,
+  and `/` and `\` are the same separator. Elsewhere a path matches only
+  itself. What is *kept* is always verbatim — matching is case-insensitive,
+  printing is not.
+- Only the command is shortened. The label is prose you wrote, and a path in
+  one is there because you put it there.
+- Nothing is stored shortened. This is a view: widening a prefix or deleting
+  the file brings the full command straight back, for workloads already
+  queued as much as for new ones. What *is* stored is capped at 200
+  characters, and shortening happens after that — so a command that was
+  already clipped to `...` stays clipped, however much of it a prefix
+  removes.
+- **Write Windows paths unquoted, or in `'single quotes'`.** In a YAML
+  *double*-quoted scalar `\t` is a tab and `\b` a backspace, so
+  `"C:\tools\bin\"` is not the path it looks like.
+
+Unknown keys are an error rather than being quietly ignored: `strip_prefixes`
+for `strip-prefixes` would otherwise be a setting that appears to do nothing.
+A file that cannot be read or parsed is reported — on stderr for `status`, and
+in the frame for `monitor`, which has no stderr to use — and the view falls
+back to full commands rather than withholding the queue over a display
+setting.
 
 ## Scope
 
@@ -555,9 +637,13 @@ decoding, selection movement and the priority keystroke are unit-tested, the
 last against a real database. The alternate-screen view itself needs a real
 console, and so does putting the keyboard into cbreak mode, so changes to
 either are worth running by eye. Environment variables
-`WORKGATE_DB`, `WORKGATE_HEARTBEAT_INTERVAL_MS`, `WORKGATE_STALE_THRESHOLD_MS`
-and `WORKGATE_POLL_INTERVAL_MS` exist solely so tests can isolate state and
-shorten timings; they are not user-facing configuration.
+`WORKGATE_DB`, `WORKGATE_CONFIG`, `WORKGATE_HEARTBEAT_INTERVAL_MS`,
+`WORKGATE_STALE_THRESHOLD_MS` and `WORKGATE_POLL_INTERVAL_MS` exist so tests
+can isolate state and shorten timings; they are not the intended way to
+configure workgate. The end-to-end tests set `WORKGATE_CONFIG` to a file that
+is not there, so that a developer with `strip-prefixes` set for their own
+machine does not see commands shortened out from under an assertion about
+them.
 
 ## Intentional limitations
 
@@ -589,6 +675,12 @@ shorten timings; they are not user-facing configuration.
   is the manual remedy, deliberately a human decision rather than a scheduler
   heuristic. There is no preemption, and no per-resource or per-project
   default level.
+- Configuration is display-only, and per OS user. There is no way to set a
+  default priority, a resource, or anything else that would change what runs
+  next: a queue two sessions share must not depend on a file only one of them
+  has. It is also not per project — the file lives with the user, like the
+  database, and a per-project one would make the same command print
+  differently depending on where it was started.
 - Deliberately excluded: explicit acquire/release commands, multi-resource
   acquisition, preemption, priority aging, retries, daemons, networking, and
   per-project scopes.

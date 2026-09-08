@@ -58,12 +58,21 @@ func TestMain(m *testing.M) {
 // fastEnv configures a per-test database and quick polling/heartbeat, with a
 // stale threshold long enough that healthy processes are never at risk.
 func fastEnv(dbPath string) []string {
-	return []string{
+	return append([]string{
 		"WORKGATE_DB=" + dbPath,
 		"WORKGATE_POLL_INTERVAL_MS=100",
 		"WORKGATE_HEARTBEAT_INTERVAL_MS=200",
 		"WORKGATE_STALE_THRESHOLD_MS=30000",
-	}
+	}, noConfigEnv(dbPath)...)
+}
+
+// noConfigEnv points a child at a configuration file that is not there. These
+// tests spawn real processes, which would otherwise read the configuration of
+// whoever is running the suite: a developer with strip-prefixes set for their
+// own machine would see command lines shortened out from under an assertion
+// about them, on their machine and nowhere else.
+func noConfigEnv(dbPath string) []string {
+	return []string{"WORKGATE_CONFIG=" + filepath.Join(filepath.Dir(dbPath), "absent.yaml")}
 }
 
 type wgProc struct {
@@ -338,12 +347,12 @@ func TestStatusEmpty(t *testing.T) {
 func TestStaleWorkloadRecoveryAfterHardKill(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "wg.db")
-	env := []string{
+	env := append([]string{
 		"WORKGATE_DB=" + dbPath,
 		"WORKGATE_POLL_INTERVAL_MS=100",
 		"WORKGATE_HEARTBEAT_INTERVAL_MS=300",
 		"WORKGATE_STALE_THRESHOLD_MS=2500",
-	}
+	}, noConfigEnv(dbPath)...)
 	d := openTestDB(t, dbPath)
 
 	a := startWG(t, dir, env, "run", "stale-res", "--label", "doomed", "--",
@@ -610,5 +619,73 @@ func TestStatusRejectsBadArguments(t *testing.T) {
 		if !isExitError(err, &ee) || ee.ExitCode() != 2 {
 			t.Errorf("%v: exit = %v, want usage error 2\n%s", args, err, out)
 		}
+	}
+}
+
+// TestStatusReadsTheConfigurationFile runs the real binary against a real
+// configuration file: the pieces are unit-tested apart, and this is the one
+// check that the path resolution, the parse, and the renderer are wired to
+// each other in a shipped process.
+func TestStatusReadsTheConfigurationFile(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "wg.db")
+	d := openTestDB(t, dbPath)
+
+	// The helper's own directory is the prefix to strip, so the assertion is
+	// about a path this test genuinely produced rather than an invented one.
+	cfg := filepath.Join(dir, "config.yaml")
+	contents := "display:\n  strip-prefixes:\n    - " + filepath.Dir(helperExe) + "\n"
+	if err := os.WriteFile(cfg, []byte(contents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	env := append(fastEnv(dbPath), "WORKGATE_CONFIG="+cfg)
+
+	startWG(t, dir, env, "run", "config-res", "--label", "Configured", "--",
+		helperExe, "-sleep", "20s")
+	waitFor(t, 15*time.Second, "running", func() bool {
+		ws := listState(t, d, "config-res")
+		return len(ws) == 1 && ws[0].State == "running"
+	})
+
+	cmd := exec.Command(workgateExe, "status", "config-res")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), env...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("status: %v\n%s", err, out)
+	}
+	got := string(out)
+	if strings.Contains(got, filepath.Dir(helperExe)) {
+		t.Errorf("status did not strip the configured prefix:\n%s", got)
+	}
+	if !strings.Contains(got, filepath.Base(helperExe)+" -sleep 20s") {
+		t.Errorf("status lost the command along with the prefix:\n%s", got)
+	}
+}
+
+// A configuration file workgate cannot read must not cost the user the queue:
+// the warning goes to stderr and the entries are printed as they always were.
+func TestStatusSurvivesABrokenConfigurationFile(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "wg.db")
+	cfg := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfg, []byte("display:\n  strip_prefixes: [x]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	env := append(fastEnv(dbPath), "WORKGATE_CONFIG="+cfg)
+
+	cmd := exec.Command(workgateExe, "status")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), env...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("status: %v\n%s", err, out)
+	}
+	got := string(out)
+	if !strings.Contains(got, "warning") || !strings.Contains(got, cfg) {
+		t.Errorf("status did not name the broken configuration file:\n%s", got)
+	}
+	if !strings.Contains(got, "No active workgate workloads.") {
+		t.Errorf("status stopped showing the queue:\n%s", got)
 	}
 }

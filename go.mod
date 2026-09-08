@@ -3,6 +3,7 @@ module workgate
 go 1.25.0
 
 require (
+	go.yaml.in/yaml/v3 v3.0.5
 	golang.org/x/sys v0.47.0
 	modernc.org/sqlite v1.57.0
 )

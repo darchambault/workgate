@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"workgate/internal/config"
 	"workgate/internal/db"
 	"workgate/internal/gitmeta"
 	"workgate/internal/queue"
@@ -48,6 +49,15 @@ waiting workload and right/left raise and lower its priority.
 
 "--recent" appends the last few workloads that finished, with how each one
 ended; the monitor always shows them.
+
+Nothing needs configuring. An optional file in the user config directory
+(%APPDATA%\Workgate\config.yaml on Windows, ~/.config/Workgate/config.yaml on
+Linux, ~/Library/Application Support/Workgate/config.yaml on macOS) can strip
+long install roots off the commands "status" and "monitor" print:
+
+  display:
+    strip-prefixes:
+      - D:\Projects\
 
 Resource names: [a-zA-Z0-9][a-zA-Z0-9._-]* (case-insensitive, max 64 chars).
 `
@@ -265,6 +275,11 @@ func cmdStatus(args []string) int {
 			fmt.Fprintf(os.Stderr, "workgate: %v\n", err)
 			return 2
 		}
+	}
+	// Reported on stderr, where this command's own diagnostics already go, so
+	// that a status piped into something else stays exactly the queue.
+	if cfgErr := loadDisplayConfig(); cfgErr != nil {
+		note("warning: %v", cfgErr)
 	}
 	path, err := db.Path()
 	if err != nil {
@@ -547,15 +562,44 @@ func entryLine(id string, col2 span, timer string, priority int) line {
 // read whole, and the terminal width, applied by fitFrame, is the only limit
 // either one needs. The command is dimmed: it is the least-consulted fact on
 // an entry, and it should not compete with the label above it.
+//
+// The command is the one thing here the configuration file can shorten. The
+// label is left exactly as written: it is prose a person chose, where the
+// command is machine-generated text whose interesting part is often buried
+// behind an install root shared by every row on screen.
 func continuationLines(label, command string) []line {
 	var out []line
 	if label != "" {
 		out = append(out, plainLine(continuationIndent+fmt.Sprintf("%q", label)))
 	}
-	if command != "" {
+	if command = displayConfig.ShortenCommand(command); command != "" {
 		out = append(out, styledLine(styleDim, continuationIndent+command))
 	}
 	return out
+}
+
+// displayConfig is the configuration the views render through. It is process
+// state rather than a parameter threaded through the renderers because that
+// is what it is: one file, read once, that cannot change while a command runs
+// — the same shape as queue.LoadEnvOverrides.
+//
+// It starts as an empty configuration and stays that way for `run`, which
+// displays no entries and should not be made to depend on a file it never
+// reads. `status` and `monitor` replace it through loadDisplayConfig.
+var displayConfig = &config.Config{}
+
+// loadDisplayConfig installs the user's configuration for the views, and
+// returns what went wrong if anything did.
+//
+// A broken configuration file is reported but never fatal. The queue is what
+// these commands are for, and refusing to show it over a mistyped display
+// setting would take away the answer along with the question — so the view
+// falls back to unshortened commands, exactly what it showed before any file
+// existed, and says on screen that it did.
+func loadDisplayConfig() error {
+	cfg, err := config.Load()
+	displayConfig = cfg
+	return err
 }
 
 // prioritySpan renders the priority column. It always occupies priorityWidth,
