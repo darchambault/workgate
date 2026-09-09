@@ -295,15 +295,17 @@ disposable and may be swept at any time, and this is a file you wrote.
 ### Shortening displayed commands
 
 An entry shows the command on a line of its own, and on a real machine most of
-that line is the same install root over and over — a toolchain directory, a
-virtualenv, the parent every agent worktree hangs off. `strip-prefixes` names
-those roots, and the views drop them:
+that line is the same leading noise over and over — a toolchain directory, a
+virtualenv, the parent every agent worktree hangs off, the launcher every one
+of them is started through. `strip-prefixes` names that text, and the views
+drop it:
 
 ```yaml
 display:
   strip-prefixes:
     - C:\Users\you\AppData\Local\Programs\Python\Python312\
     - D:\Projects\
+    - 'powershell -NoProfile -ExecutionPolicy Bypass -File '
 ```
 
 ```text
@@ -320,14 +322,19 @@ instead of the same entry running out to
 `C:\Users\you\AppData\Local\Programs\Python\Python312\python.exe`, whose
 interesting half a narrow terminal never reaches.
 
+- An entry is **literal text, matched exactly as written.** Nothing is added
+  to it, so write the trailing separator yourself: `D:\Projects` strips less
+  than `D:\Projects\`, and leaves the line starting on a bare `\`.
+- It does not have to be a path. A launcher invocation is the same problem in
+  different clothes, and ends at a space rather than a separator — which is
+  why nothing is completed for you. Workgate would have to guess which of the
+  two a prefix ends at, and guessing `-File\` builds a needle no command can
+  contain: a setting that fails silently. A prefix written short fails
+  visibly instead, by leaving the separator on screen.
 - A prefix is removed **everywhere it appears**, not only at the front. A
   command routinely names one root twice — once for the program, once for the
   file it is given — and shortening only the first leaves the line as long as
   it was.
-- A trailing separator is supplied if you leave it off, so `D:\Projects` and
-  `D:\Projects\` mean the same thing. Without it the command would start on a
-  bare separator, which reads like a path from the root of the drive and is
-  not one.
 - Where two prefixes overlap, the longer one wins on each occurrence, whatever
   order the file lists them in.
 - On Windows, matching follows Windows' own path rules: ASCII case is ignored,
@@ -342,7 +349,16 @@ interesting half a narrow terminal never reaches.
   characters, and shortening happens after that — so a command that was
   already clipped to `...` stays clipped, however much of it a prefix
   removes.
-- **Write Windows paths unquoted, or in `'single quotes'`.** In a YAML
+
+Two things about YAML itself are worth knowing here, because both fail
+quietly:
+
+- **A trailing space only survives inside quotes.** YAML strips trailing
+  whitespace from an unquoted scalar, so the launcher prefix above must be
+  written `'powershell -NoProfile -ExecutionPolicy Bypass -File '`, quotes
+  included. Leading and trailing whitespace you did *not* mean is removed by
+  the parser the same way, and workgate adds no trimming of its own.
+- **Write Windows paths unquoted, or in `'single quotes'`.** In a
   *double*-quoted scalar `\t` is a tab and `\b` a backspace, so
   `"C:\tools\bin\"` is not the path it looks like.
 

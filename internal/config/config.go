@@ -53,14 +53,14 @@ func Path() (string, error) {
 // Config is the whole of workgate's user configuration.
 //
 // The compiled form of the settings is kept alongside the decoded YAML rather
-// than derived per call: Load normalizes once, and the views then call
-// ShortenCommand for every line of every frame.
+// than derived per call: Load sifts and orders the list once, and the views
+// then call ShortenCommand for every line of every frame.
 type Config struct {
 	Display Display `yaml:"display"`
 
-	// stripPrefixes is Display.StripPrefixes normalized and ordered by
-	// descending length, so that where two configured prefixes overlap the
-	// more specific one claims an occurrence first.
+	// stripPrefixes is Display.StripPrefixes with the unusable entries
+	// dropped, ordered by descending length so that where two configured
+	// prefixes overlap the more specific one claims an occurrence first.
 	stripPrefixes []string
 }
 
@@ -68,11 +68,24 @@ type Config struct {
 // render. A section rather than top-level keys, so that a later setting which
 // does change behaviour cannot be mistaken for one of these.
 type Display struct {
-	// StripPrefixes are leading paths removed from the command shown under
-	// an entry. Machines accumulate long, uninteresting install roots —
+	// StripPrefixes is leading text removed from the command shown under an
+	// entry. Machines accumulate long, uninteresting install roots —
 	// toolchain directories, virtualenvs, an agent's worktree parent — and
 	// repeating one on every line pushes the part that differs off the
 	// right edge of a narrow terminal.
+	//
+	// An entry is literal text, matched exactly as written. Usually it is a
+	// path, but a launcher invocation is the same problem wearing different
+	// clothes — every row on a Windows box can open with
+	// "powershell -NoProfile -ExecutionPolicy Bypass -File " — and a path
+	// is only the common case, not the rule.
+	//
+	// Nothing is added to an entry, in particular not a trailing separator
+	// where one is missing. Completing a prefix means guessing whether it
+	// ends at a separator or at a space, and a wrong guess builds a needle
+	// that cannot occur in any command: a setting that fails silently. A
+	// prefix written short instead leaves a visible separator at the front
+	// of the line, which says what to fix.
 	StripPrefixes []string `yaml:"strip-prefixes"`
 }
 
@@ -128,7 +141,11 @@ func loadFile(path string) (*Config, error) {
 func (c *Config) compile() {
 	c.stripPrefixes = nil
 	for _, p := range c.Display.StripPrefixes {
-		if p = normalizePrefix(p); p != "" {
+		// An entry that is only whitespace is what a half-edited list
+		// leaves behind. It is the one thing dropped here, because it
+		// would otherwise match between every pair of words in every
+		// command on screen.
+		if strings.TrimSpace(p) != "" {
 			c.stripPrefixes = append(c.stripPrefixes, p)
 		}
 	}
@@ -138,25 +155,6 @@ func (c *Config) compile() {
 	sort.SliceStable(c.stripPrefixes, func(i, j int) bool {
 		return len(c.stripPrefixes[i]) > len(c.stripPrefixes[j])
 	})
-}
-
-// normalizePrefix trims a configured prefix and gives it a trailing separator,
-// returning "" for one that holds nothing.
-//
-// The trailing separator is supplied rather than required, so that
-// "D:\Projects\workgate" and "D:\Projects\workgate\" mean the same thing.
-// Without it the first would leave the command starting on a bare separator —
-// "\build\tool.exe" — which reads like a path from the root of the drive and
-// is not one.
-func normalizePrefix(p string) string {
-	p = strings.TrimSpace(p)
-	if p == "" {
-		return ""
-	}
-	if !isSeparator(p[len(p)-1]) {
-		p += string(os.PathSeparator)
-	}
-	return p
 }
 
 // ShortenCommand returns command with every configured prefix removed, and is
@@ -230,11 +228,4 @@ func matchKey(s string) string {
 		}
 	}
 	return string(b)
-}
-
-// isSeparator reports whether c ends a path element. Windows accepts both
-// separators, and a configured prefix written with either should be taken as
-// already terminated.
-func isSeparator(c byte) bool {
-	return c == '/' || (runtime.GOOS == "windows" && c == '\\')
 }

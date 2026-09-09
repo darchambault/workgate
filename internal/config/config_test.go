@@ -136,12 +136,20 @@ func TestStripsEveryOccurrence(t *testing.T) {
 	}
 }
 
-// Written without one, a prefix still means "up to and including the
-// separator": leaving it would produce "\build\tool.exe", which reads as a
-// path from the root of the drive and is not one.
-func TestPrefixWithoutTrailingSeparator(t *testing.T) {
+// A prefix is the text the file gives, and nothing is added to it. Written
+// without its trailing separator, one leaves that separator at the front of
+// the line — which is visible, and says what to fix. Supplying it instead
+// would mean guessing whether this prefix ends at a separator or at a space,
+// and the wrong guess is a needle no command can contain.
+func TestAPrefixIsMatchedExactlyAsWritten(t *testing.T) {
 	c := load(t, "display:\n  strip-prefixes:\n    - "+sep("D:/Projects/workgate")+"\n")
 	got := c.ShortenCommand(sep("D:/Projects/workgate/build/tool.exe") + " --fast")
+	if want := sep("/build/tool.exe") + " --fast"; got != want {
+		t.Errorf("ShortenCommand = %q, want %q", got, want)
+	}
+	// With the separator written in, the whole of it goes.
+	c = load(t, "display:\n  strip-prefixes:\n    - "+sep("D:/Projects/workgate/")+"\n")
+	got = c.ShortenCommand(sep("D:/Projects/workgate/build/tool.exe") + " --fast")
 	if want := sep("build/tool.exe") + " --fast"; got != want {
 		t.Errorf("ShortenCommand = %q, want %q", got, want)
 	}
@@ -174,15 +182,47 @@ func TestBlankPrefixesAreIgnored(t *testing.T) {
 	}
 }
 
-// Surrounding whitespace in the file is not part of the path the user meant.
-//
-// Single-quoted, because a Windows path in a *double*-quoted YAML scalar is
-// not the path it looks like: there, \t is a tab and \b a backspace. Users
-// meet this too, which is why the README writes prefixes unquoted.
-func TestPrefixesAreTrimmed(t *testing.T) {
-	c := load(t, "display:\n  strip-prefixes:\n    - '  "+sep("C:/tools/")+"  '\n")
+// Whitespace around an unquoted entry is YAML's to remove, and it does. This
+// is why nothing here trims: after the parser there is nothing left to trim
+// except what a user quoted on purpose.
+func TestUnquotedEntriesArriveTrimmed(t *testing.T) {
+	c := load(t, "display:\n  strip-prefixes:\n    -    "+sep("C:/tools/")+"   \n")
 	if got := c.ShortenCommand(sep("C:/tools/go.exe")); got != "go.exe" {
 		t.Errorf("ShortenCommand = %q, want %q", got, "go.exe")
+	}
+}
+
+// The non-path case: a launcher invocation opens every row on a machine and
+// ends at a space rather than a separator. It is what makes literal matching
+// the rule — no completion of a prefix could serve both this and a path.
+//
+// Quoted, so that YAML keeps the trailing space. Single-quoted specifically,
+// because a Windows path in a *double*-quoted YAML scalar is not the path it
+// looks like: there, \t is a tab and \b a backspace.
+func TestALauncherPrefixEndingAtASpace(t *testing.T) {
+	c := load(t, "display:\n  strip-prefixes:\n"+
+		"    - 'powershell -NoProfile -ExecutionPolicy Bypass -File '\n")
+	got := c.ShortenCommand(`powershell -NoProfile -ExecutionPolicy Bypass -File run.ps1 -Task build`)
+	if want := "run.ps1 -Task build"; got != want {
+		t.Errorf("ShortenCommand = %q, want %q", got, want)
+	}
+}
+
+// The exact case that sent us here: a launcher prefix ending at a space, and
+// the install root it names, are the two halves of one line, and both have to
+// go for the line to get shorter.
+func TestTheReportedConfiguration(t *testing.T) {
+	root := `C:\Users\domin\.cache\codex-runtimes\codex-primary-runtime\dependencies\native\powershell\`
+	c := load(t, "display:\n  strip-prefixes:\n"+
+		"    - '"+root+"'\n"+
+		"    - 'powershell -NoProfile -ExecutionPolicy Bypass -File '\n")
+	got := c.ShortenCommand(
+		"powershell -NoProfile -ExecutionPolicy Bypass -File " + root + `run.ps1 -Task build`)
+	// Both halves are literal text present verbatim in the command, so this
+	// holds on every platform: nothing here depends on a backslash being a
+	// separator, only on it being the byte the command also has.
+	if want := "run.ps1 -Task build"; got != want {
+		t.Errorf("ShortenCommand = %q, want %q", got, want)
 	}
 }
 
