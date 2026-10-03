@@ -85,13 +85,20 @@ CREATE TABLE IF NOT EXISTS workloads (
 	git_branch        TEXT,
 	command_display   TEXT,
 	hostname          TEXT,
-	-- Declared last so a database created here and one brought up to date
-	-- by migratePriority (which can only append) have the same column
-	-- order. NOT NULL DEFAULT 3 is what makes the column compatible in
+	-- Declared after every original column so a database created here and
+	-- one brought up to date by the priority migration (which can only
+	-- append) have the same column order. NOT NULL DEFAULT 3 is what makes the column compatible in
 	-- both directions: rows that predate it read as the neutral level,
 	-- and an older workgate binary, whose INSERT does not mention the
 	-- column, still writes a valid row.
-	priority          INTEGER NOT NULL DEFAULT 3 CHECK (priority BETWEEN 1 AND 5)
+	priority          INTEGER NOT NULL DEFAULT 3 CHECK (priority BETWEEN 1 AND 5),
+	-- The workload a row belongs to, when one workload holds several
+	-- resources: one row per resource, every one of them carrying the id of
+	-- the first. NULL on rows written by a binary that predates it, which
+	-- makes such a row a workload of its own - the group key everywhere is
+	-- IFNULL(group_id, id). Declared after priority because its migration runs
+	-- after the priority one, and both can only append.
+	group_id          TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_workloads_resource_seq ON workloads(resource, seq);
 -- Hard correctness backstop: SQLite itself refuses a second 'running' row
@@ -120,7 +127,7 @@ CREATE TABLE IF NOT EXISTS completions (
 	repository_root   TEXT,
 	git_branch        TEXT,
 	-- Declared last for the same reason priority is on workloads: a database
-	-- created here and one brought up to date by migrateCompletionCommand
+	-- created here and one brought up to date by its migration
 	-- (which can only append) must have the same column order.
 	command_display   TEXT
 );
@@ -138,6 +145,13 @@ CREATE INDEX IF NOT EXISTS idx_completions_resource_seq ON completions(resource,
 const (
 	addPriorityColumn = `ALTER TABLE workloads ADD COLUMN priority INTEGER NOT NULL DEFAULT 3 CHECK (priority BETWEEN 1 AND 5)`
 
+	// The workload a row belongs to; see the column in schema. Nullable with
+	// no default, so a row written before it existed - or by an older binary
+	// afterwards, whose INSERT does not mention it - is its own workload.
+	// Nothing indexes it: the group key is IFNULL(group_id, id), which no index
+	// on the column could serve, and the table holds a few dozen rows.
+	addGroupColumn = `ALTER TABLE workloads ADD COLUMN group_id TEXT`
+
 	// The command a completion ran. Nullable with no default, so rows written
 	// before it existed read back as NULL and render as the blank line they
 	// have always been - there is no command to invent for them.
@@ -153,45 +167,30 @@ func migrate(d *sql.DB) error {
 	if _, err := d.Exec(schema); err != nil {
 		return fmt.Errorf("initializing schema: %w", err)
 	}
-	if err := migratePriority(d); err != nil {
-		return err
-	}
-	return migrateCompletionCommand(d)
-}
-
-// migrateCompletionCommand adds the command column to a completions table that
-// predates it, the same way and for the same reason migratePriority does.
-// There is no index to create alongside it: the column is display-only and
-// nothing ever selects or orders by it.
-func migrateCompletionCommand(d *sql.DB) error {
-	tx, err := d.Begin()
-	if err != nil {
-		return fmt.Errorf("beginning schema migration: %w", err)
-	}
-	defer tx.Rollback()
-
-	has, err := hasColumn(tx, "completions", "command_display")
-	if err != nil {
-		return err
-	}
-	if has {
-		return tx.Commit()
-	}
-	if _, alterErr := tx.Exec(addCompletionCommand); alterErr != nil {
-		// As in migratePriority, the condition that matters is "the column
-		// exists", not "my ALTER succeeded".
-		if has, err = hasColumn(tx, "completions", "command_display"); err != nil {
+	// Order matters twice over: each ALTER appends, so running them in the
+	// order the columns are declared in schema is what keeps a migrated table
+	// and a fresh one in the same column order; and priorityIndex names a
+	// column that only exists once the ALTER before it has run.
+	for _, m := range []struct {
+		table, column, alter string
+		then                 []string
+	}{
+		{"workloads", "priority", addPriorityColumn, []string{priorityIndex}},
+		{"workloads", "group_id", addGroupColumn, nil},
+		// No index alongside it: the column is display-only and nothing ever
+		// selects or orders by it.
+		{"completions", "command_display", addCompletionCommand, nil},
+	} {
+		if err := addColumn(d, m.table, m.column, m.alter, m.then...); err != nil {
 			return err
-		} else if !has {
-			return fmt.Errorf("adding the command_display column: %w", alterErr)
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
-// migratePriority adds the priority column to a database that predates it.
+// addColumn adds column to a table that predates it, then runs then.
 // CREATE TABLE IF NOT EXISTS cannot add a column to a table that already
-// exists, so this is the one piece of schema that needs a real migration.
+// exists, so every column added after the first release needs this.
 //
 // Several workgate processes routinely open this database at the same moment,
 // so the check and the ALTER run inside one immediate transaction (the DSN's
@@ -200,28 +199,30 @@ func migrateCompletionCommand(d *sql.DB) error {
 // failed ALTER keeps this correct even if the DDL ever escaped that lock - the
 // condition that matters is "the column exists", not "my ALTER succeeded", so
 // nothing here depends on matching SQLite's error text.
-func migratePriority(d *sql.DB) error {
+func addColumn(d *sql.DB, table, column, alter string, then ...string) error {
 	tx, err := d.Begin()
 	if err != nil {
 		return fmt.Errorf("beginning schema migration: %w", err)
 	}
 	defer tx.Rollback()
 
-	has, err := hasColumn(tx, "workloads", "priority")
+	has, err := hasColumn(tx, table, column)
 	if err != nil {
 		return err
 	}
 	if !has {
-		if _, alterErr := tx.Exec(addPriorityColumn); alterErr != nil {
-			if has, err = hasColumn(tx, "workloads", "priority"); err != nil {
+		if _, alterErr := tx.Exec(alter); alterErr != nil {
+			if has, err = hasColumn(tx, table, column); err != nil {
 				return err
 			} else if !has {
-				return fmt.Errorf("adding the priority column: %w", alterErr)
+				return fmt.Errorf("adding the %s column: %w", column, alterErr)
 			}
 		}
 	}
-	if _, err := tx.Exec(priorityIndex); err != nil {
-		return fmt.Errorf("creating the priority index: %w", err)
+	for _, q := range then {
+		if _, err := tx.Exec(q); err != nil {
+			return fmt.Errorf("migrating the %s column: %w", column, err)
+		}
 	}
 	return tx.Commit()
 }

@@ -138,7 +138,10 @@ func downgrade(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 	defer d.Close()
+	// group_id goes too: it was added after priority, so a database that
+	// predates priorities predates it as well.
 	for _, q := range []string{
+		`ALTER TABLE workloads DROP COLUMN group_id`,
 		`DROP INDEX IF EXISTS idx_workloads_resource_priority_seq`,
 		`ALTER TABLE workloads DROP COLUMN priority`,
 	} {
@@ -337,6 +340,96 @@ func TestConcurrentOpenMigratesTheCompletionCommandOnce(t *testing.T) {
 			}
 			defer d.Close()
 			_, err = d.Exec(`SELECT COUNT(*) FROM completions WHERE command_display IS NULL`)
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent open: %v", err)
+		}
+	}
+}
+
+// downgradeGroups strips group_id back off, leaving priority in place: the
+// shape of a database last opened by a binary from before multi-resource
+// workloads.
+func downgradeGroups(t *testing.T, path string) {
+	t.Helper()
+	d, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if _, err := d.Exec(`ALTER TABLE workloads DROP COLUMN group_id`); err != nil {
+		t.Fatalf("simulating a pre-group schema: %v", err)
+	}
+}
+
+// TestOpenAddsGroupsToAPreExistingDatabase is the upgrade proof for group_id.
+// A row written before the column existed must read back NULL, which is what
+// makes it a workload of its own.
+func TestOpenAddsGroupsToAPreExistingDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "workgate.db")
+	if d, err := Open(path); err != nil {
+		t.Fatal(err)
+	} else {
+		d.Close()
+	}
+	downgradeGroups(t, path)
+
+	// Seeded through raw SQL rather than Open, which would migrate the column
+	// straight back: this is the old shape, written as an older binary would.
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO workloads (id, resource, state, created_at, heartbeat_at)
+	                       VALUES ('aaa111', 'gpu', 'running', 1, 1)`); err != nil {
+		t.Fatalf("seeding a workload: %v", err)
+	}
+	raw.Close()
+
+	d, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopening: %v", err)
+	}
+	defer d.Close()
+	var group sql.NullString
+	if err := d.QueryRow(`SELECT group_id FROM workloads WHERE id = 'aaa111'`).Scan(&group); err != nil {
+		t.Fatalf("group_id missing after upgrade: %v", err)
+	}
+	if group.Valid {
+		t.Errorf("migrated row group_id = %q, want NULL", group.String)
+	}
+}
+
+// TestConcurrentOpenMigratesGroupsOnce: several sessions can reach a pre-group
+// database together, and none of them may fail.
+func TestConcurrentOpenMigratesGroupsOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "workgate.db")
+	if d, err := Open(path); err != nil {
+		t.Fatal(err)
+	} else {
+		d.Close()
+	}
+	downgradeGroups(t, path)
+
+	const openers = 8
+	errs := make(chan error, openers)
+	var wg sync.WaitGroup
+	for i := 0; i < openers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d, err := Open(path)
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer d.Close()
+			_, err = d.Exec(`SELECT COUNT(*) FROM workloads WHERE group_id IS NULL`)
 			errs <- err
 		}()
 	}

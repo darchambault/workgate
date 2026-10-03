@@ -2,6 +2,7 @@ package queue
 
 import (
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -146,11 +147,7 @@ func TestPositionCountsTheRunningWorkloadAhead(t *testing.T) {
 	urgent := enqueueAt(t, d, "unity", PriorityHighest)
 
 	for w, want := range map[*Workload]int{running: 1, urgent: 2, waiting: 3} {
-		got, err := Position(d, w)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got != want {
+		if got := position(t, d, w); got != want {
 			t.Errorf("Position(%s) = %d, want %d", w.ID, got, want)
 		}
 	}
@@ -171,11 +168,11 @@ func TestSetPriorityReordersWaitingQueue(t *testing.T) {
 		t.Errorf("change = %d -> %d, want %d -> %d", ch.From, ch.To, PriorityDefault, PriorityHighest)
 	}
 	// Position 2: behind the holder, ahead of the waiter it just overtook.
-	if ch.Position != 2 {
-		t.Errorf("position = %d, want 2", ch.Position)
+	if want := []Place{{"unity", 2}}; !reflect.DeepEqual(ch.Places, want) {
+		t.Errorf("places = %+v, want %+v", ch.Places, want)
 	}
-	if ch.Resource != "unity" || ch.Label != "test" || ch.State != "waiting" {
-		t.Errorf("context = %s/%q/%s, want unity/test/waiting", ch.Resource, ch.Label, ch.State)
+	if ch.Label != "test" || ch.State != "waiting" {
+		t.Errorf("context = %q/%s, want test/waiting", ch.Label, ch.State)
 	}
 
 	if err := Release(d, holder, Outcome{Kind: OutcomeOK}); err != nil {
@@ -221,8 +218,8 @@ func TestSetPriorityOnRunningWorkloadChangesNoOrder(t *testing.T) {
 	if ch.State != "running" {
 		t.Errorf("state = %q, want running", ch.State)
 	}
-	if ch.Position != 1 {
-		t.Errorf("position = %d, want 1 (a running workload is never preempted)", ch.Position)
+	if want := []Place{{"unity", 1}}; !reflect.DeepEqual(ch.Places, want) {
+		t.Errorf("places = %+v, want %+v (a running workload is never preempted)", ch.Places, want)
 	}
 	// The waiter must not be promoted past a holder that merely lowered itself.
 	mustNotAcquire(t, d, waiter)
@@ -291,7 +288,7 @@ func TestSetPriorityRejectsOutOfRangeLevel(t *testing.T) {
 func TestEnqueueRejectsInvalidPriority(t *testing.T) {
 	d, _ := testDB(t)
 	for _, level := range []int{0, 6, -1} {
-		if _, err := Enqueue(d, "unity", level, Meta{Label: "test"}); err == nil {
+		if _, err := Enqueue(d, []string{"unity"}, level, Meta{Label: "test"}); err == nil {
 			t.Errorf("level %d was accepted", level)
 		}
 	}

@@ -248,7 +248,7 @@ func (m *monitorState) applyPriority(d *sql.DB, ws []queue.Workload, step int, n
 		// not matter.
 		m.say(now, "%s started running; priority %d no longer affects scheduling", ch.ID, ch.To)
 	default:
-		m.say(now, "%s: priority %d -> %d (now position %d)", ch.ID, ch.From, ch.To, ch.Position)
+		m.say(now, "%s: priority %d -> %d (now %s)", ch.ID, ch.From, ch.To, positionText(ch.Places))
 	}
 }
 
@@ -272,28 +272,33 @@ func applyKey(d *sql.DB, m *monitorState, ws []queue.Workload, k key, now time.T
 
 // reclaimedNotice says what the monitor removed, in the words status uses when
 // it removes the same thing. A row that vanishes between frames otherwise looks
-// like one that finished.
+// like one that finished. The rows of one workload are one workload removed.
 func reclaimedNotice(rs []queue.StaleRemoved) string {
-	if len(rs) == 1 {
-		return fmt.Sprintf("Removed stale workload %s from %q (its owner has exited)", rs[0].ID, rs[0].Resource)
-	}
-	ids := make([]string, len(rs))
-	for i, r := range rs {
-		ids[i] = r.ID
+	ids, from := staleByWorkload(rs)
+	if len(ids) == 1 {
+		return fmt.Sprintf("Removed stale workload %s from %s (its owner has exited)", ids[0], quoteList(from[ids[0]]))
 	}
 	return fmt.Sprintf("Removed stale workloads %s (their owners have exited)", strings.Join(ids, ", "))
 }
 
-// selectable returns the rows the highlight can land on, in display order.
+// selectable returns the workloads the highlight can land on, in display
+// order.
 //
 // The running workload is not one of them. It already holds the resource, and
 // workgate never preempts, so re-prioritizing it would be a keystroke with
 // nothing behind it — worse than one that does nothing at all, because the P
 // column would move and the queue would not.
+//
+// A workload waiting for several resources is listed under each of them, but
+// is one stop for the highlight: its first appearance. The marker still lands
+// on every appearance, since it is drawn by id; stopping on each would make a
+// keystroke that moves the selection look like one that did nothing.
 func selectable(ws []queue.Workload) []queue.Workload {
 	var out []queue.Workload
+	seen := map[string]bool{}
 	for _, w := range ws {
-		if w.State != "running" {
+		if w.State != "running" && !seen[w.ID] {
+			seen[w.ID] = true
 			out = append(out, w)
 		}
 	}

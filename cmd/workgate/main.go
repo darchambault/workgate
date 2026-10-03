@@ -1,7 +1,7 @@
 // Command workgate provides machine-global, named, exclusive execution of
 // locally launched workloads, ordered by priority and then by arrival:
 //
-//	workgate run <resource> [--label "<text>"] [--priority <1-5>] -- <command> [args...]
+//	workgate run <resource>[,<resource>...] [--label "<text>"] [--priority <1-5>] -- <command> [args...]
 //	workgate status [<resource>]
 //	workgate monitor [<resource>] [--interval <duration>]
 //	workgate priority <id> <1-5>
@@ -28,7 +28,7 @@ import (
 const usage = `workgate - machine-global exclusive execution of local workloads
 
 Usage:
-  workgate run <resource> [--label "<description>"] [--priority <1-5>] -- <command> [args...]
+  workgate run <resource>[,<resource>...] [--label "<description>"] [--priority <1-5>] -- <command> [args...]
   workgate status [<resource>] [--recent[=<count>]]
   workgate monitor [<resource>] [--interval <duration>]
   workgate priority <id> <1-5>
@@ -37,6 +37,10 @@ Workloads targeting the same resource execute one at a time, across all
 projects and terminals on this machine: the highest priority first, and in
 strict arrival order within one priority level. The resource is released
 automatically when the wrapped command exits.
+
+A comma-separated list names up to 4 resources a command needs together
+("run myproject,gpu"). It waits holding none of them and takes them all at
+once, so two such commands can never deadlock.
 
 Priority runs from 1 (highest) to 5 (lowest) and defaults to 3. A higher
 priority overtakes workloads that are still waiting, but never interrupts one
@@ -102,12 +106,12 @@ func fail(err error) int {
 }
 
 func cmdRun(args []string) int {
-	resource, label, priorityArg, argv, err := parseRunArgs(args)
+	resourceArg, label, priorityArg, argv, err := parseRunArgs(args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "workgate: %v\n\n%s", err, usage)
 		return 2
 	}
-	resource, err = queue.ValidateResource(resource)
+	resources, err := queue.ValidateResources(resourceArg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "workgate: %v\n", err)
 		return 2
@@ -143,7 +147,7 @@ func cmdRun(args []string) int {
 		Hostname:         info.Hostname,
 	}
 
-	w, err := queue.Enqueue(d, resource, priority, meta)
+	w, err := queue.Enqueue(d, resources, priority, meta)
 	if err != nil {
 		return fail(err)
 	}
@@ -174,7 +178,7 @@ func cmdRun(args []string) int {
 		if err := queue.Release(d, w, outcome); err != nil {
 			note("warning: releasing workload: %v", err)
 		} else if wasRunning {
-			note("Released %q", resource)
+			note("Released %s", quoteList(resources))
 		}
 	}
 	defer release()
@@ -185,21 +189,21 @@ func cmdRun(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), shutdownSignals()...)
 	defer stop()
 
-	onStale := func(r queue.StaleRemoved) {
-		note("Removed stale workload %s from %q", r.ID, r.Resource)
+	onStale := func(rs []queue.StaleRemoved) {
+		for _, n := range staleNotices(rs) {
+			note("%s", n)
+		}
 	}
 
 	acquired, removed, err := queue.TryAcquire(d, w)
-	for _, r := range removed {
-		onStale(r)
-	}
+	onStale(removed)
 	if err != nil {
 		return fail(err)
 	}
 	if !acquired {
-		pos, perr := queue.Position(d, w)
-		if perr != nil {
-			pos = 0
+		places, perr := queue.Positions(d, w)
+		if perr != nil || len(places) != len(resources) {
+			places = nil
 		}
 		// The label is what tells one queued workload from another; with none
 		// there is nothing to name it by, and the colon would dangle.
@@ -207,20 +211,20 @@ func cmdRun(args []string) int {
 		if label != "" {
 			named = ": " + label
 		}
-		if pos > 0 {
-			note("Queued for %q (position %d)%s%s", resource, pos, atPriority(priority), named)
+		if places != nil {
+			note("Queued for %s%s%s", fmtPlaces(places), atPriority(priority), named)
 		} else {
-			note("Queued for %q%s%s", resource, atPriority(priority), named)
+			note("Queued for %s%s%s", quoteList(resources), atPriority(priority), named)
 		}
 		err = queue.Await(ctx, d, w, queue.AwaitEvents{
 			OnStaleRemoved: onStale,
-			OnLongWait: func(pos int, waited time.Duration) {
-				note("Still waiting for %q (position %d, %s elapsed)", resource, pos, fmtElapsed(waited))
+			OnLongWait: func(places []queue.Place, waited time.Duration) {
+				note("%s", stillWaiting(places, waited))
 			},
 		})
 		switch {
 		case errors.Is(err, context.Canceled):
-			note("Interrupted while waiting for %q", resource)
+			note("Interrupted while waiting for %s", quoteList(resources))
 			return runner.ExitInterrupted
 		case errors.Is(err, queue.ErrGone):
 			return fail(errors.New("workload was removed as stale by another process " +
@@ -229,7 +233,7 @@ func cmdRun(args []string) int {
 			return fail(err)
 		}
 	}
-	note("Acquired %q", resource)
+	note("Acquired %s", quoteList(resources))
 
 	code, err := runner.Run(ctx, argv, func(msg string) { note("warning: %s", msg) })
 	if err != nil {
@@ -295,8 +299,8 @@ func cmdStatus(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	for _, r := range removed {
-		note("Removed stale workload %s from %q", r.ID, r.Resource)
+	for _, n := range staleNotices(removed) {
+		note("%s", n)
 	}
 
 	workloads, err := queue.List(d, resource)
@@ -465,7 +469,11 @@ func selectedStatusLines(workloads []queue.Workload, now int64, flagStale bool, 
 				entry = append(entry, span{text: "  " + p})
 			}
 			out = append(out, entry)
-			out = append(out, continuationLines(w.Label, w.CommandDisplay)...)
+			also := "also waits for: "
+			if w.State == "running" {
+				also = "also holds: "
+			}
+			out = append(out, continuationLines(w.Label, alsoLine(also, w.Resource, w.Resources), w.CommandDisplay)...)
 		}
 	}
 	return out
@@ -503,8 +511,11 @@ func completionLines(cs []queue.Completion, now int64, showResource bool) []line
 		// Suffix order is truncation order, most important first. Without
 		// the resource an unscoped row is unattributable; the age is next;
 		// the worktree costs the least to lose.
+		// Unscoped, a workload that held several resources is one entry, and
+		// the resource column names them all - in the form `run` took them,
+		// so it reads as the workload rather than as a sentence.
 		if showResource {
-			entry = append(entry, span{text: "  " + c.Resource})
+			entry = append(entry, span{text: "  " + strings.Join(completionResources(c), ",")})
 		}
 		context := displayContextOf(c.RepositoryRoot, c.WorkingDirectory, c.GitBranch)
 		agoText := fmtAgo(time.Duration(now-c.FinishedAt) * time.Millisecond)
@@ -520,8 +531,13 @@ func completionLines(cs []queue.Completion, now int64, showResource bool) []line
 		}
 		out = append(out, entry)
 		// A completion recorded before the column existed has no command, and
-		// simply renders the one line it always did.
-		out = append(out, continuationLines(c.Label, c.CommandDisplay)...)
+		// simply renders the one line it always did. Scoped to one resource,
+		// the others the workload held get the line a live entry would have.
+		also := ""
+		if !showResource {
+			also = alsoLine("also held: ", c.Resource, completionResources(c))
+		}
+		out = append(out, continuationLines(c.Label, also, c.CommandDisplay)...)
 	}
 	return out
 }
@@ -556,9 +572,10 @@ func entryLine(id string, col2 span, timer string, priority int) line {
 }
 
 // continuationLines returns the rows that sit under an entry's header row: the
-// label, and then the command that was run. Each is skipped when there is none
-// — a workload with no label gets no label line, rather than a placeholder
-// standing in for one — and only a live workload has a command to show.
+// label, then the other resources the workload holds or waits for, and then
+// the command that was run. Each is skipped when there is none — a workload
+// with no label gets no label line, rather than a placeholder standing in for
+// one, and a workload of one resource gets no "also" line.
 //
 // Neither is clamped. Ending its own line is exactly what lets a long label be
 // read whole, and the terminal width, applied by fitFrame, is the only limit
@@ -569,15 +586,47 @@ func entryLine(id string, col2 span, timer string, priority int) line {
 // label is left exactly as written: it is prose a person chose, where the
 // command is machine-generated text whose interesting part is often buried
 // behind an install root shared by every row on screen.
-func continuationLines(label, command string) []line {
+func continuationLines(label, also, command string) []line {
 	var out []line
 	if label != "" {
 		out = append(out, plainLine(continuationIndent+fmt.Sprintf("%q", label)))
+	}
+	if also != "" {
+		out = append(out, plainLine(continuationIndent+also))
 	}
 	if command = displayConfig.ShortenCommand(command); command != "" {
 		out = append(out, styledLine(styleDim, continuationIndent+command))
 	}
 	return out
+}
+
+// alsoLine names the resources a workload has besides the one whose section
+// it is listed in, after prefix - "also holds: ", say. A workload of one
+// resource has nothing to add, and gets "".
+//
+// Its own line rather than a marker on the header row: it is what explains a
+// wait that the queue it sits in does not, and a header row truncated to a
+// narrow terminal would lose it first.
+func alsoLine(prefix, resource string, resources []string) string {
+	var others []string
+	for _, r := range resources {
+		if r != resource {
+			others = append(others, r)
+		}
+	}
+	if len(others) == 0 {
+		return ""
+	}
+	return prefix + strings.Join(others, ", ")
+}
+
+// completionResources is every resource a completion's workload held. A
+// Completion built without them - by a test, say - held its own.
+func completionResources(c queue.Completion) []string {
+	if len(c.Resources) > 0 {
+		return c.Resources
+	}
+	return []string{c.Resource}
 }
 
 // displayConfig is the configuration the views render through. It is process
@@ -837,6 +886,88 @@ func atPriority(level int) string {
 	return fmt.Sprintf(" at priority %d", level)
 }
 
+// quoteList names resources the way every message does: "gpu", or
+// "myproject" and "gpu", or "a", "b" and "c". One resource reads exactly as a
+// single %q did, so a single-resource run says what it always said.
+func quoteList(resources []string) string {
+	q := make([]string, len(resources))
+	for i, r := range resources {
+		q[i] = strconv.Quote(r)
+	}
+	return andList(q)
+}
+
+// fmtPlaces names each resource with the workload's position in its queue:
+// "gpu" (position 3), or "myproject" (position 2) and "gpu" (position 1).
+func fmtPlaces(places []queue.Place) string {
+	parts := make([]string, len(places))
+	for i, p := range places {
+		parts[i] = fmt.Sprintf("%q (position %d)", p.Resource, p.Position)
+	}
+	return andList(parts)
+}
+
+// positionText is the position half of a priority notice: "position 2" for a
+// workload of one resource, and "position 2 on "myproject", 1 on "gpu"" for one
+// of several, where a bare number would not say which queue it is about.
+func positionText(places []queue.Place) string {
+	switch len(places) {
+	case 0:
+		return "position unknown"
+	case 1:
+		return fmt.Sprintf("position %d", places[0].Position)
+	}
+	parts := make([]string, len(places))
+	for i, p := range places {
+		parts[i] = fmt.Sprintf("%d on %q", p.Position, p.Resource)
+	}
+	return "position " + strings.Join(parts, ", ")
+}
+
+// stillWaiting is the long-wait notice. A workload of one resource keeps the
+// wording it always had.
+func stillWaiting(places []queue.Place, waited time.Duration) string {
+	if len(places) == 1 {
+		return fmt.Sprintf("Still waiting for %q (position %d, %s elapsed)",
+			places[0].Resource, places[0].Position, fmtElapsed(waited))
+	}
+	return fmt.Sprintf("Still waiting for %s; %s elapsed", fmtPlaces(places), fmtElapsed(waited))
+}
+
+// staleNotices words a reclaim, one notice per workload: a workload of several
+// resources is reclaimed whole, and reporting each of its rows would read as
+// several workloads removed.
+func staleNotices(rs []queue.StaleRemoved) []string {
+	ids, from := staleByWorkload(rs)
+	out := make([]string, len(ids))
+	for i, id := range ids {
+		out[i] = fmt.Sprintf("Removed stale workload %s from %s", id, quoteList(from[id]))
+	}
+	return out
+}
+
+// staleByWorkload groups reclaimed rows by workload, in the order first seen.
+func staleByWorkload(rs []queue.StaleRemoved) (ids []string, from map[string][]string) {
+	from = map[string][]string{}
+	for _, r := range rs {
+		if _, seen := from[r.ID]; !seen {
+			ids = append(ids, r.ID)
+		}
+		from[r.ID] = append(from[r.ID], r.Resource)
+	}
+	return ids, from
+}
+
+func andList(items []string) string {
+	switch len(items) {
+	case 0:
+		return ""
+	case 1:
+		return items[0]
+	}
+	return strings.Join(items[:len(items)-1], ", ") + " and " + items[len(items)-1]
+}
+
 // cmdPriority re-prioritizes a workload that is already queued. It is the only
 // command that writes a row another session owns, which is the point: the
 // process that would otherwise change its own mind is blocked inside its own
@@ -877,8 +1008,8 @@ func cmdPriority(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	for _, r := range removed {
-		note("Removed stale workload %s from %q", r.ID, r.Resource)
+	for _, n := range staleNotices(removed) {
+		note("%s", n)
 	}
 
 	ch, err := queue.SetPriority(d, id, level)
@@ -902,10 +1033,10 @@ func cmdPriority(args []string) int {
 		note("%s %q: priority %d -> %d (already running; priority no longer affects scheduling)",
 			ch.ID, label, ch.From, ch.To)
 	case ch.From == ch.To:
-		note("%s %q: priority already %d (position %d)", ch.ID, label, ch.To, ch.Position)
+		note("%s %q: priority already %d (%s)", ch.ID, label, ch.To, positionText(ch.Places))
 	default:
-		note("%s %q: priority %d -> %d (now position %d)",
-			ch.ID, label, ch.From, ch.To, ch.Position)
+		note("%s %q: priority %d -> %d (now %s)",
+			ch.ID, label, ch.From, ch.To, positionText(ch.Places))
 	}
 	return 0
 }

@@ -29,11 +29,30 @@ func enqueue(t *testing.T, d *sql.DB, resource string) *Workload {
 
 func enqueueAt(t *testing.T, d *sql.DB, resource string, priority int) *Workload {
 	t.Helper()
-	w, err := Enqueue(d, resource, priority, Meta{Label: "test", PID: 1234})
+	return enqueueAll(t, d, priority, resource)
+}
+
+// enqueueAll enqueues one workload that needs every one of resources.
+func enqueueAll(t *testing.T, d *sql.DB, priority int, resources ...string) *Workload {
+	t.Helper()
+	w, err := Enqueue(d, resources, priority, Meta{Label: "test", PID: 1234})
 	if err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
 	return w
+}
+
+// position is a single-resource workload's place in its queue.
+func position(t *testing.T, d *sql.DB, w *Workload) int {
+	t.Helper()
+	places, err := Positions(d, w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(places) != 1 {
+		t.Fatalf("Positions(%s) = %+v, want exactly one place", w.ID, places)
+	}
+	return places[0].Position
 }
 
 func mustAcquire(t *testing.T, d *sql.DB, w *Workload) {
@@ -61,7 +80,7 @@ func mustNotAcquire(t *testing.T, d *sql.DB, w *Workload) {
 func backdateHeartbeat(t *testing.T, d *sql.DB, w *Workload, age time.Duration) {
 	t.Helper()
 	old := time.Now().Add(-age).UnixMilli()
-	if _, err := d.Exec(`UPDATE workloads SET heartbeat_at = ? WHERE id = ?`, old, w.ID); err != nil {
+	if _, err := d.Exec(`UPDATE workloads SET heartbeat_at = ? WHERE `+groupKey+` = ?`, old, w.ID); err != nil {
 		t.Fatalf("backdating heartbeat: %v", err)
 	}
 }
@@ -323,11 +342,7 @@ func TestPositionCountsEarlierWorkloads(t *testing.T) {
 	c := enqueue(t, d, "unity")
 
 	for w, want := range map[*Workload]int{a: 1, b: 2, c: 3} {
-		got, err := Position(d, w)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got != want {
+		if got := position(t, d, w); got != want {
 			t.Errorf("Position(%s) = %d, want %d", w.ID, got, want)
 		}
 	}
@@ -370,7 +385,7 @@ func completions(t *testing.T, d *sql.DB) []Completion {
 
 func TestReleaseRecordsCompletion(t *testing.T) {
 	d, _ := testDB(t)
-	w, err := Enqueue(d, "gpu", PriorityDefault, Meta{
+	w, err := Enqueue(d, []string{"gpu"}, PriorityDefault, Meta{
 		Label: "build wheels", PID: 4321,
 		WorkingDirectory: "/src/proj", RepositoryRoot: "/src/proj", GitBranch: "feature-x",
 		CommandDisplay: "make wheels -j8",
@@ -454,7 +469,7 @@ func TestReleaseRecordsAtMostOnce(t *testing.T) {
 
 func TestStaleRunningWorkloadIsRecordedAsStale(t *testing.T) {
 	d, _ := testDB(t)
-	a, err := Enqueue(d, "gpu", PriorityDefault, Meta{
+	a, err := Enqueue(d, []string{"gpu"}, PriorityDefault, Meta{
 		Label: "doomed", PID: 1234, CommandDisplay: "sleep 900",
 	})
 	if err != nil {
@@ -512,7 +527,7 @@ func TestStaleRecordingHappensInsideTryAcquire(t *testing.T) {
 // enqueueOwned enqueues a workload as if pid on host had run it.
 func enqueueOwned(t *testing.T, d *sql.DB, resource, host string, pid int) *Workload {
 	t.Helper()
-	w, err := Enqueue(d, resource, PriorityDefault, Meta{Label: "owned", PID: pid, Hostname: host})
+	w, err := Enqueue(d, []string{resource}, PriorityDefault, Meta{Label: "owned", PID: pid, Hostname: host})
 	if err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}

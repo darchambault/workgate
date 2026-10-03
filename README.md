@@ -17,14 +17,16 @@ workgate run gpu --label "Run integration tests" -- test-runner --suite integrat
 
 Workloads targeting the same resource run strictly one at a time: the highest
 priority first, and in arrival order within one priority level. Workloads
-targeting different resources run concurrently. The resource is released
-automatically when the wrapped command exits — or, if the process is killed
-outright, recovered automatically via heartbeat staleness.
+targeting different resources run concurrently, and a workload that needs
+several — a project *and* the GPU — names them all and takes them all at once.
+The resource is released automatically when the wrapped command exits — or,
+if the process is killed outright, recovered automatically via heartbeat
+staleness.
 
 ## Usage
 
 ```text
-workgate run <resource> [--label "<description>"] [--priority <1-5>] -- <command> [args...]
+workgate run <resource>[,<resource>...] [--label "<description>"] [--priority <1-5>] -- <command> [args...]
 workgate status [<resource>] [--recent[=<count>]]
 workgate monitor [<resource>] [--interval <duration>]
 workgate priority <id> <1-5>
@@ -34,6 +36,9 @@ workgate priority <id> <1-5>
   (no shell interpretation; quote arguments for your own shell as usual).
 - Resource names: `[a-zA-Z0-9][a-zA-Z0-9._-]*`, max 64 chars, case-insensitive
   (`GPU`, `Gpu`, and `gpu` share one queue).
+- `run` takes up to four resources as a comma-separated list
+  (`myproject,gpu`), for a command that needs all of them at once; see
+  [Multiple resources](#multiple-resources) below.
 - `--label` is diagnostic only. Without it an entry simply has no label: the
   views show the command on a line of its own regardless, and no placeholder
   stands in for the description you did not write.
@@ -122,6 +127,66 @@ else has to speak for it:
   heuristic. If something is starved, promote it.
 - A waiting workload's position can therefore go **up** as well as down. Higher
   priority work arriving behind you is normal, not a stall.
+
+### Multiple resources
+
+Some commands need more than one thing to themselves: a build that must not
+overlap another build of the same project, and that also needs the GPU. Name
+every resource in one `run`:
+
+```sh
+workgate run myproject,gpu --label "Train and package" -- python train.py
+```
+
+```text
+[workgate] Queued for "myproject" (position 2) and "gpu" (position 1): Train and package
+[workgate] Acquired "myproject" and "gpu"
+...child output...
+[workgate] Released "myproject" and "gpu"
+```
+
+- **All at once, or not at all.** The workload waits holding *none* of its
+  resources, and takes every one of them in the single transaction that
+  acquires one. It never holds `myproject` while it waits for `gpu`.
+- **That is why it cannot deadlock.** The alternative — nesting
+  `workgate run myproject -- workgate run gpu -- …` — holds the first resource
+  idle while waiting for the second, and two sessions that nest in opposite
+  orders wait for each other forever. Don't nest runs; name both.
+- **One order across every queue.** A workload ranks by priority and then
+  arrival on every resource it names, so two waiters can never each be ahead
+  of the other. The order you list the resources in changes nothing but how
+  they are displayed.
+- **A waiter keeps its place everywhere, even on an idle resource.** While the
+  workload above waits for `myproject`, a later `gpu`-only command waits behind
+  it, even though the GPU is free. Letting it through would let a steady supply
+  of GPU-only work starve the workload that needs both, indefinitely. The cost
+  is an idle resource for a while, and the answer to that, as for any queue
+  that matters to you, is `workgate priority`.
+- **A position per queue.** It is next once it is first in every queue and
+  nothing is running on any of them. `workgate priority` re-prioritizes the
+  whole workload, and reports where that leaves it in each queue:
+  `(now position 2 on "myproject", 1 on "gpu")`.
+- **Listed under each resource.** `status` and `monitor` show the workload in
+  every queue it is in, with a line saying what else it holds or waits for:
+
+  ```text
+  RESOURCE: gpu
+
+  RUNNING
+    49ce3e   pid 77900  00:04    P3  MyApp [main]
+             "Train and package"
+             also holds: myproject
+             python train.py
+  ```
+
+  Finished, it is one entry: under `LAST COMPLETED` for one resource it says
+  `also held: …`, and in the unscoped view its resource column reads
+  `myproject,gpu`. In the monitor it is one stop for the selection, however
+  many queues it is in, and the `>` marks it in all of them.
+- At most **four** resources, each named once. `a,,b`, `gpu,GPU` and a fifth
+  name are usage errors (exit `2`).
+- A workload whose owner dies is reclaimed whole: the next `run` on *any* of
+  its resources frees all of them, and reports it once.
 
 ### Monitoring
 
@@ -218,12 +283,13 @@ refreshing every 1s - up/down select - right raises priority - q to stop
     on a console too old for virtual terminal input, the monitor silently offers
     no keys and cannot re-prioritize anything — the footer only offers keys that
     work. (It still clears workloads whose owner is dead, as above.)
-- **An entry is up to three lines**: a header row of fixed-width columns —
+- **An entry is up to four lines**: a header row of fixed-width columns —
   id, pid, elapsed, priority, then the worktree and its branch — followed by
-  the label and the command, each on a line of its own and indented under the
-  id. Either continuation is dropped when there is nothing to put on it, so an
-  unlabelled workload costs two lines rather than spending one on a
-  placeholder. Stacking is what lets a long label and a long command be read
+  the label, the other resources of a [multi-resource](#multiple-resources)
+  workload, and the command, each on a line of its own and indented under the
+  id. Each continuation is dropped when there is nothing to put on it, so an
+  unlabelled single-resource workload costs two lines rather than spending
+  them on placeholders. Stacking is what lets a long label and a long command be read
   whole: sharing one row, they competed with the worktree and the `[STALE]`
   marker for the right-hand side of the screen. `status` prints exactly the
   same entry, so the two views cannot drift apart.
@@ -476,6 +542,11 @@ Run any such operation through workgate:
 
     workgate run <resource> --label "<short description>" -- <command>
 
+An operation that needs several of the resources below names them all in
+one run, separated by commas:
+
+    workgate run <resource>,<resource> --label "<short description>" -- <command>
+
 Defined shared resources:
 
 - `gpu` — ANY command that requires exclusive access to the GPU
@@ -507,6 +578,8 @@ Rules:
    errors, not the command's.
 8. Do not wrap commands that need no exclusive access — that only
    serializes work that could run in parallel.
+   If a command needs several resources, name them all in one `workgate
+   run`; never put one `workgate run` inside another, which can deadlock.
 9. Do not pass `--priority` unless a rule above tells you to; the default
    is correct for ordinary work. Never raise your own priority to get out
    of a queue, and never run `workgate priority` on a workload you did
@@ -559,20 +632,33 @@ CREATE TABLE workloads (
   heartbeat_at      INTEGER NOT NULL,
   working_directory TEXT, repository_root TEXT, git_common_dir TEXT,
   git_branch        TEXT, command_display TEXT, hostname TEXT,
-  priority          INTEGER NOT NULL DEFAULT 3 CHECK (priority BETWEEN 1 AND 5)
+  priority          INTEGER NOT NULL DEFAULT 3 CHECK (priority BETWEEN 1 AND 5),
+  group_id          TEXT  -- the workload's id on every one of its rows
 );
 CREATE INDEX idx_workloads_resource_seq ON workloads(resource, seq);
 CREATE INDEX idx_workloads_resource_priority_seq ON workloads(resource, priority, seq);
 CREATE UNIQUE INDEX idx_one_running ON workloads(resource) WHERE state = 'running';
 ```
 
-`priority` is the one column that needs a real migration: `CREATE TABLE IF NOT
-EXISTS` cannot add a column to a table that already exists, so opening a
-database that predates priorities runs an `ALTER TABLE` first, inside the same
-immediate transaction that every other write uses. `NOT NULL DEFAULT 3` is what
-keeps the two binary versions compatible in both directions — rows written
-before the column existed read as the neutral level, and an older binary, whose
-`INSERT` never mentions the column, still writes a valid row.
+`priority` and `group_id` were added after the first release, and need a real
+migration: `CREATE TABLE IF NOT EXISTS` cannot add a column to a table that
+already exists, so opening an older database runs an `ALTER TABLE` first,
+inside the same immediate transaction that every other write uses. `NOT NULL
+DEFAULT 3` is what keeps the binary versions compatible in both directions —
+rows written before the column existed read as the neutral level, and an older
+binary, whose `INSERT` never mentions the column, still writes a valid row.
+
+A workload with several resources is **one row per resource**. The first row's
+`id` is the workload's, and every row carries it in `group_id`; the other rows'
+own ids are never shown. A row with no `group_id` — every row an older binary
+writes — is a workload of its own, so the workload key throughout is
+`IFNULL(group_id, id)`. Keeping a row per resource is what keeps
+`idx_one_running` meaningful for multi-resource workloads, and keeps an older
+binary safe on a shared database: it sees each row as a workload of its own,
+and so waits for a resource a multi-resource workload holds. It does list
+those rows as separate workloads, and its stale cleanup can remove one of
+them; the workload that loses a row then stops, reporting it was removed as
+stale, rather than go on holding the rest.
 
 A second table holds the recent-completions ring. Nothing reads it to make a
 coordination decision; it exists only so `monitor` and `status --recent` can
@@ -601,6 +687,10 @@ CREATE INDEX idx_completions_resource_seq ON completions(resource, seq);
   able to fail a release and strand a resource.
 - The partial unique index makes a second `running` row per resource
   impossible at the database level, independent of application logic.
+- A workload's rows are inserted in one transaction, so their `seq`s are
+  consecutive and no other workload's can fall between them. Comparing two
+  rows on `(priority, seq)` is then the same as comparing their workloads,
+  which is what makes the rank one total order across every resource.
 - Non-default pragmas (chosen deliberately): `journal_mode=WAL` (readers never
   block the short write transactions), `busy_timeout=5000`,
   `synchronous=NORMAL` (safe with WAL; this is live coordination state, not an
@@ -609,18 +699,19 @@ CREATE INDEX idx_completions_resource_seq ON completions(resource, seq);
 
 The lifecycle:
 
-1. **Enqueue** — one transaction inserts the row with `state='waiting'` and
-   `heartbeat_at` already set (no window where a fresh row looks stale).
+1. **Enqueue** — one transaction inserts a row per resource with
+   `state='waiting'` and `heartbeat_at` already set (no window where a fresh
+   row looks stale).
 2. **Wait** — conservative polling (~750 ms); no transaction is held while
    waiting. A heartbeat goroutine refreshes `heartbeat_at` every 5 s for the
-   row's whole life. Each poll re-reads the row's own priority, which is what
+   workload's whole life, on all of its rows in one statement. Each poll re-reads the row's own priority, which is what
    lets `workgate priority` from another terminal take effect within one poll
    interval without any signalling. Occasional "still waiting" notices;
    otherwise quiet.
-3. **Acquire** — one short `BEGIN IMMEDIATE` transaction: delete stale rows
-   for the resource (heartbeat older than 60 s), verify no owner exists and
-   that no waiting row for the resource outranks this one on `(priority,
-   seq)`, then flip it to `running`. Atomicity guarantees two processes can
+3. **Acquire** — one short `BEGIN IMMEDIATE` transaction: delete stale
+   workloads on its resources (heartbeat older than 60 s), verify that on
+   every one of them no owner exists and no waiting row outranks this one on
+   `(priority, seq)`, then flip all of its rows to `running`. Atomicity guarantees two processes can
    never both win and cleanup can never race acquisition; `seq` is unique, so
    `(priority, seq)` is a strict total order and exactly one waiter can pass
    the rank check. A newer workload can overtake a healthy older waiter only
@@ -635,17 +726,18 @@ The lifecycle:
    whole group with SIGINT, then SIGKILL after the grace period, and Linux
    additionally arms `PR_SET_PDEATHSIG` so a hard-killed workgate takes the
    direct child with it.
-5. **Release** — one transaction deletes the row and, if the workload actually
-   held the resource, records how it ended in the completions ring
+5. **Release** — one transaction deletes the workload's rows and, if it
+   actually held its resources, records how it ended in the completions ring,
+   once per resource
    (deferred-path, automatic; also on Ctrl+C after terminating the child).
    Deleting and recording together is what stops a crash between the two from
    leaving a resource held. Completed workloads are removed from the queue and
    summarised, not archived.
 
 **Crash recovery:** if a workgate process is killed so hard that no cleanup
-runs, its row simply stops heartbeating; the next acquisition attempt on that
-resource (or any `workgate status`) removes it after the 60-second stale
-threshold and reports:
+runs, its rows simply stop heartbeating; the next acquisition attempt on any
+of its resources (or any `workgate status`) removes the whole workload after
+the 60-second stale threshold and reports:
 
 ```text
 [workgate] Removed stale workload fd2b09 from "gpu"
@@ -667,7 +759,8 @@ go test ./...
 ```
 
 Tests include multi-process end-to-end coverage (ordering across real
-processes, priority overtaking and live re-prioritization,
+processes, priority overtaking and live re-prioritization, multi-resource
+workloads waiting, blocking and crossing without deadlock,
 hard-kill recovery by both the next `run` and a watching `monitor`, exit-code
 propagation, and completions surviving both a clean exit and a hard kill).
 `monitor` is covered through its
@@ -720,9 +813,12 @@ them.
   has. It is also not per project — the file lives with the user, like the
   database, and a per-project one would make the same command print
   differently depending on where it was started.
-- Deliberately excluded: explicit acquire/release commands, multi-resource
-  acquisition, preemption, priority aging, retries, daemons, networking, and
-  per-project scopes.
+- A multi-resource workload holds its place on every resource it names, even
+  one that sits idle while it waits for another. That idle time is the price
+  of never starving it; see [Multiple resources](#multiple-resources). It may
+  name at most four.
+- Deliberately excluded: explicit acquire/release commands, preemption,
+  priority aging, retries, daemons, networking, and per-project scopes.
 - There is no history. The recent-completions ring is a display aid, bounded
   at ten per resource and expiring after a day, with no command to query it
   beyond the last few — not a record you can go back to.

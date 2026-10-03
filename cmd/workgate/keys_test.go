@@ -372,7 +372,7 @@ func TestKeysReorderTheQueueAndKeepTheSelection(t *testing.T) {
 	dbFile := filepath.Join(t.TempDir(), "wg.db")
 	d := openTestDB(t, dbFile)
 	for _, l := range []string{"First", "Second", "Third"} {
-		if _, err := queue.Enqueue(d, "gpu", queue.PriorityDefault, queue.Meta{Label: l}); err != nil {
+		if _, err := queue.Enqueue(d, []string{"gpu"}, queue.PriorityDefault, queue.Meta{Label: l}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -428,7 +428,7 @@ func TestKeysReorderTheQueueAndKeepTheSelection(t *testing.T) {
 // different levels must not be able to compound each other's readings.
 func TestLeftLowersThePriority(t *testing.T) {
 	d := openTestDB(t, filepath.Join(t.TempDir(), "wg.db"))
-	w, err := queue.Enqueue(d, "gpu", queue.PriorityDefault, queue.Meta{Label: "One"})
+	w, err := queue.Enqueue(d, []string{"gpu"}, queue.PriorityDefault, queue.Meta{Label: "One"})
 	if err != nil {
 		t.Fatal(err)
 	}
