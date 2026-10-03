@@ -338,6 +338,19 @@ func TestMonitorBodyEmptyStates(t *testing.T) {
 	}
 }
 
+// The notice names what was removed and where, in status's words, and one line
+// covers any number of rows: the frame has one notice slot.
+func TestReclaimedNotice(t *testing.T) {
+	one := reclaimedNotice([]queue.StaleRemoved{{ID: "86cd4b", Resource: "gpu", State: "running"}})
+	if want := `Removed stale workload 86cd4b from "gpu" (its owner has exited)`; one != want {
+		t.Errorf("one = %q, want %q", one, want)
+	}
+	two := reclaimedNotice([]queue.StaleRemoved{{ID: "86cd4b", Resource: "gpu"}, {ID: "1eabb7", Resource: "cpu"}})
+	if want := "Removed stale workloads 86cd4b, 1eabb7 (their owners have exited)"; two != want {
+		t.Errorf("two = %q, want %q", two, want)
+	}
+}
+
 // A failed read must not blank the view: the last good body stays on screen
 // with a warning appended.
 func TestMonitorFrameKeepsBodyOnReadError(t *testing.T) {

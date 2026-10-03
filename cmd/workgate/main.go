@@ -448,8 +448,10 @@ func selectedStatusLines(workloads []queue.Workload, now int64, flagStale bool, 
 			if selected != "" && w.ID == selected {
 				entry[0] = span{text: rowGutterSelected, style: styleBold}
 			}
-			// The monitor never removes stale rows, so it labels them instead:
-			// this owner has stopped heartbeating, and the next run or status
+			// The monitor removes a stale row only once its owner is known to
+			// have exited, so it labels the rest: this owner has stopped
+			// heartbeating but may be alive — asleep, suspended, or on a pid
+			// that cannot be judged — and a run on this resource or any status
 			// will clear the entry.
 			//
 			// The marker goes before the worktree deliberately. A narrow

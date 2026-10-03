@@ -175,14 +175,32 @@ refreshing every 1s - up/down select - right raises priority - q to stop
   Resizing the window mid-run is fine — each frame is re-fitted, and a window
   too short for the whole queue ends with a count of what did not fit rather
   than dropping it silently.
-- **Monitoring never removes a workload.** Unlike `status`, it does not reclaim
-  abandoned ones; it labels them `[STALE]` and leaves them to the next `run` or
-  `status`. Watching a resource should not change who owns it. The only thing a
-  monitor writes is a priority, for the row you selected and only on the
-  keystroke that asks for it. (The database is still opened normally, which
-  applies the idempotent `CREATE TABLE IF NOT EXISTS` schema step and, once on a
-  database that predates priorities, the `ALTER TABLE` that adds the column — so
-  even an untouched monitor is not literally zero writes.)
+- **Monitoring removes a workload only once its owner is dead.** A workload
+  whose heartbeat has gone stale is labelled `[STALE]`. It is removed — and
+  moves to `LAST COMPLETED` as `stale` — only when the monitor can also see
+  that the `workgate` process that owns it has exited. That is a stricter rule
+  than `status` applies. `status` reclaims on a stale heartbeat alone. A
+  monitor is left open for hours, across machine sleeps, and after a sleep every
+  heartbeat is stale at once: reclaiming on that alone would take the resource
+  from an owner that is only late, and let a second workload start while the
+  first one's command still runs. A dead process cannot come back, so its row
+  goes on the next refresh.
+  - Only processes on this machine are judged, and anything the monitor cannot
+    be sure of counts as alive. An owner it may not inspect, or a pid it cannot
+    tell apart from a newcomer, keeps its `[STALE]` label until a `run` on that
+    resource or any `status` clears it. On Windows, where pids are reused
+    readily, a pid now held by a process that started after the workload was
+    queued is recognised as a newcomer. Elsewhere a reused pid is simply taken as alive.
+  - This matters most for a resource named after one project or worktree. A
+    `run` only reclaims its own resource, so an abandoned row on a resource
+    nobody runs again would otherwise stay under RUNNING until somebody typed
+    `workgate status`.
+  - Apart from that, the only thing a monitor writes is a priority, for the row
+    you selected and only on the keystroke that asks for it. (The database is
+    still opened normally, which applies the idempotent `CREATE TABLE IF NOT
+    EXISTS` schema step and, once on a database that predates priorities, the
+    `ALTER TABLE` that adds the column — so even an untouched monitor is not
+    literally zero writes.)
 - **The keys are four arrows and `q`.** Up and down move the highlight through
   the waiting workloads; right raises the selected one's priority and left
   lowers it, clamped at 1 and 5. `j`/`k`/`h`/`l` do the same, Esc drops the
@@ -197,8 +215,9 @@ refreshing every 1s - up/down select - right raises priority - q to stop
   - A selected workload that finishes takes the highlight with it, rather than
     leaving it on whichever row inherited the place.
   - Keys need a terminal at **both** ends. With stdin or stdout redirected, or
-    on a console too old for virtual terminal input, the monitor is silently the
-    read-only view it has always been — the footer only offers keys that work.
+    on a console too old for virtual terminal input, the monitor silently offers
+    no keys and cannot re-prioritize anything — the footer only offers keys that
+    work. (It still clears workloads whose owner is dead, as above.)
 - **An entry is up to three lines**: a header row of fixed-width columns —
   id, pid, elapsed, priority, then the worktree and its branch — followed by
   the label and the command, each on a line of its own and indented under the
@@ -257,10 +276,10 @@ LAST COMPLETED
 - Outcomes are `ok`, `exit <code>`, `killed` (signalled, or crashed),
   `canceled` (interrupted mid-run), and `stale` (the owner stopped
   heartbeating and was reclaimed). Everything that held the resource is
-  recorded, so a hard-killed workload leaves a trace rather than vanishing —
-  though, since `monitor` never removes a row, such a workload reads
-  `[STALE]` in the live section until the next `run` or `status` reclaims it
-  and moves it down here.
+  recorded, so a hard-killed workload leaves a trace rather than vanishing.
+  A monitor moves one down here about a minute after its owner dies, once the
+  heartbeat is stale and the process is gone; until then it reads `[STALE]` in
+  the live section.
 - The command is copied off the workload row in the same transaction that
   deletes it, so it survives however the workload ended — including the
   reclaim path, where nobody was around to release it. A completion recorded
@@ -624,15 +643,18 @@ The lifecycle:
    summarised, not archived.
 
 **Crash recovery:** if a workgate process is killed so hard that no cleanup
-runs, its row simply stops heartbeating; the next acquisition attempt (or
-`workgate status`) removes it after the 60-second stale threshold and reports:
+runs, its row simply stops heartbeating; the next acquisition attempt on that
+resource (or any `workgate status`) removes it after the 60-second stale
+threshold and reports:
 
 ```text
 [workgate] Removed stale workload fd2b09 from "gpu"
 ```
 
 The reclaimed workload is recorded as `stale` in the completions ring at the
-same moment, so a hard kill leaves a trace rather than vanishing.
+same moment, so a hard kill leaves a trace rather than vanishing. A running
+`workgate monitor` removes such a row as well, but only once it can also see
+that the owning process has exited (see [Monitoring](#monitoring)).
 
 The threshold is 12× the heartbeat interval, deliberately conservative against
 machine sleep, debugger pauses, and scheduling stalls. A healthy 30-minute
@@ -646,8 +668,9 @@ go test ./...
 
 Tests include multi-process end-to-end coverage (ordering across real
 processes, priority overtaking and live re-prioritization,
-hard-kill recovery, exit-code propagation, and completions surviving both a
-clean exit and a hard kill). `monitor` is covered through its
+hard-kill recovery by both the next `run` and a watching `monitor`, exit-code
+propagation, and completions surviving both a clean exit and a hard kill).
+`monitor` is covered through its
 redirected-output path, and its escape sequences are asserted directly; key
 decoding, selection movement and the priority keystroke are unit-tested, the
 last against a real database. The alternate-screen view itself needs a real

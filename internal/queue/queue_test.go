@@ -509,6 +509,167 @@ func TestStaleRecordingHappensInsideTryAcquire(t *testing.T) {
 	}
 }
 
+// enqueueOwned enqueues a workload as if pid on host had run it.
+func enqueueOwned(t *testing.T, d *sql.DB, resource, host string, pid int) *Workload {
+	t.Helper()
+	w, err := Enqueue(d, resource, PriorityDefault, Meta{Label: "owned", PID: pid, Hostname: host})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	return w
+}
+
+// exitedPids is an exited callback that knows exactly which pids are dead, and
+// remembers what it was asked.
+type exitedPids struct {
+	dead  map[int]bool
+	asked []int
+}
+
+func (e *exitedPids) exited(pid int, _ time.Time) bool {
+	e.asked = append(e.asked, pid)
+	return e.dead[pid]
+}
+
+func TestCleanupAbandonedRemovesAStaleRowWhoseOwnerExited(t *testing.T) {
+	d, _ := testDB(t)
+	a := enqueueOwned(t, d, "gpu", "here", 100)
+	mustAcquire(t, d, a)
+	backdateHeartbeat(t, d, a, 2*StaleThreshold)
+
+	e := &exitedPids{dead: map[int]bool{100: true}}
+	removed, err := CleanupAbandoned(d, "", "here", e.exited)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 1 || removed[0].ID != a.ID || removed[0].State != "running" {
+		t.Fatalf("removed = %+v, want running workload %s", removed, a.ID)
+	}
+	if ws, _ := List(d, ""); len(ws) != 0 {
+		t.Fatalf("workloads remain: %+v", ws)
+	}
+	// Moved, not just deleted: this is the whole point for a view that shows
+	// what finished.
+	got := completions(t, d)
+	if len(got) != 1 || got[0].ID != a.ID || got[0].Outcome != OutcomeStale {
+		t.Fatalf("completions = %+v, want one stale entry for %s", got, a.ID)
+	}
+}
+
+// The case CleanupAbandoned exists to refuse. After a machine sleep every
+// heartbeat is stale at once; an owner that is still alive is only late.
+func TestCleanupAbandonedKeepsAStaleRowWhoseOwnerIsAlive(t *testing.T) {
+	d, _ := testDB(t)
+	a := enqueueOwned(t, d, "gpu", "here", 100)
+	mustAcquire(t, d, a)
+	backdateHeartbeat(t, d, a, 2*StaleThreshold)
+
+	e := &exitedPids{}
+	removed, err := CleanupAbandoned(d, "", "here", e.exited)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed %+v, but its owner is alive", removed)
+	}
+	if len(e.asked) != 1 || e.asked[0] != 100 {
+		t.Errorf("asked about pids %v, want [100]", e.asked)
+	}
+	if got := completions(t, d); len(got) != 0 {
+		t.Fatalf("completions = %+v, want none", got)
+	}
+}
+
+// A dead owner is not enough on its own: the heartbeat threshold still decides
+// when, so this path cannot reclaim anything sooner than every other one does.
+func TestCleanupAbandonedIgnoresAFreshHeartbeat(t *testing.T) {
+	d, _ := testDB(t)
+	a := enqueueOwned(t, d, "gpu", "here", 100)
+	mustAcquire(t, d, a)
+
+	e := &exitedPids{dead: map[int]bool{100: true}}
+	removed, err := CleanupAbandoned(d, "", "here", e.exited)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed %+v with a fresh heartbeat", removed)
+	}
+	if len(e.asked) != 0 {
+		t.Errorf("asked about pids %v for a healthy row", e.asked)
+	}
+}
+
+// A pid recorded on another machine names nothing here, and neither does a row
+// whose host was never recorded.
+func TestCleanupAbandonedJudgesOnlyThisHost(t *testing.T) {
+	d, _ := testDB(t)
+	other := enqueueOwned(t, d, "gpu", "elsewhere", 100)
+	unknown := enqueueOwned(t, d, "cpu", "", 100)
+	for _, w := range []*Workload{other, unknown} {
+		mustAcquire(t, d, w)
+		backdateHeartbeat(t, d, w, 2*StaleThreshold)
+	}
+
+	e := &exitedPids{dead: map[int]bool{100: true}}
+	for _, host := range []string{"here", ""} {
+		removed, err := CleanupAbandoned(d, "", host, e.exited)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(removed) != 0 {
+			t.Fatalf("host %q: removed %+v", host, removed)
+		}
+	}
+	if len(e.asked) != 0 {
+		t.Errorf("asked about pids %v recorded on no host of ours", e.asked)
+	}
+}
+
+func TestCleanupAbandonedIsScopedToTheResource(t *testing.T) {
+	d, _ := testDB(t)
+	a := enqueueOwned(t, d, "gpu", "here", 100)
+	b := enqueueOwned(t, d, "cpu", "here", 200)
+	for _, w := range []*Workload{a, b} {
+		mustAcquire(t, d, w)
+		backdateHeartbeat(t, d, w, 2*StaleThreshold)
+	}
+
+	e := &exitedPids{dead: map[int]bool{100: true, 200: true}}
+	removed, err := CleanupAbandoned(d, "gpu", "here", e.exited)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 1 || removed[0].ID != a.ID {
+		t.Fatalf("removed = %+v, want only %s", removed, a.ID)
+	}
+	if ws, _ := List(d, "cpu"); len(ws) != 1 || ws[0].ID != b.ID {
+		t.Fatalf("cpu workloads = %+v, want %s untouched", ws, b.ID)
+	}
+}
+
+// A waiter whose owner died never ran: removed, like any stale waiter, and not
+// recorded, like any stale waiter.
+func TestCleanupAbandonedDoesNotRecordAWaiter(t *testing.T) {
+	d, _ := testDB(t)
+	a := enqueueOwned(t, d, "gpu", "here", 100)
+	mustAcquire(t, d, a)
+	b := enqueueOwned(t, d, "gpu", "here", 200)
+	backdateHeartbeat(t, d, b, 2*StaleThreshold)
+
+	e := &exitedPids{dead: map[int]bool{200: true}}
+	removed, err := CleanupAbandoned(d, "gpu", "here", e.exited)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 1 || removed[0].ID != b.ID || removed[0].State != "waiting" {
+		t.Fatalf("removed = %+v, want waiting workload %s", removed, b.ID)
+	}
+	if got := completions(t, d); len(got) != 0 {
+		t.Fatalf("completions = %+v, want none: a stale waiter never ran", got)
+	}
+}
+
 func TestCompletionsRingIsBoundedPerResource(t *testing.T) {
 	d, _ := testDB(t)
 	// A quiet resource, written first: a busy one must not evict it.

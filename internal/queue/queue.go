@@ -668,17 +668,106 @@ func CleanupStale(d *sql.DB, resource string) ([]StaleRemoved, error) {
 	return removed, tx.Commit()
 }
 
-// deleteStaleTx removes abandoned rows and records the ones that held the
-// resource as OutcomeStale, so a hard-killed workload leaves a trace instead
-// of simply vanishing. Stale *waiting* rows never ran and are not recorded,
-// the same rule Release applies.
+// CleanupAbandoned is CleanupStale for a caller that should not be making
+// judgement calls about other sessions' workloads: it removes a stale row only
+// once the process that owns it is known to have exited. exited is asked about
+// each stale row's owner - its pid, and the time the row was enqueued, which
+// the owner was already running by - and must answer false whenever it cannot
+// be sure.
+//
+// A stale heartbeat alone is what every other cleanup acts on, and it is
+// enough for a process that is about to take the resource or has just been
+// asked to report the queue. It is not enough for something that runs
+// unattended for hours: after a machine sleep every heartbeat is stale at once,
+// and removing a running row whose owner is merely late would let a second
+// workload acquire the resource while the first child still runs. A dead owner
+// cannot come back, so its row can go at once.
+//
+// A pid means nothing on another machine, so only rows recorded under host are
+// judged; an empty host judges none.
+//
+// The candidates are read before any transaction is opened, so a queue with
+// nothing to reclaim - the ordinary case - costs one read and no write lock.
+// The delete then re-checks staleness inside the transaction: an owner that
+// heartbeated in between is not removed.
+func CleanupAbandoned(d *sql.DB, resource, host string, exited func(pid int, enqueued time.Time) bool) ([]StaleRemoved, error) {
+	if host == "" {
+		return nil, nil
+	}
+	q := `SELECT id, pid, created_at FROM workloads
+	       WHERE heartbeat_at < ? AND hostname = ? AND pid > 0`
+	args := []any{nowMillis() - StaleThreshold.Milliseconds(), host}
+	if resource != "" {
+		q += ` AND resource = ?`
+		args = append(args, resource)
+	}
+	rows, err := d.Query(q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("listing stale workloads: %w", err)
+	}
+	type candidate struct {
+		id             string
+		pid, createdAt int64
+	}
+	var stale []candidate
+	for rows.Next() {
+		var c candidate
+		if err := rows.Scan(&c.id, &c.pid, &c.createdAt); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("reading stale workload row: %w", err)
+		}
+		stale = append(stale, c)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("listing stale workloads: %w", err)
+	}
+
+	var dead []any
+	for _, c := range stale {
+		if exited(int(c.pid), time.UnixMilli(c.createdAt)) {
+			dead = append(dead, c.id)
+		}
+	}
+	if len(dead) == 0 {
+		return nil, nil
+	}
+
+	tx, err := d.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("beginning cleanup transaction: %w", err)
+	}
+	defer tx.Rollback()
+	now := nowMillis()
+	cond := `id IN (?` + strings.Repeat(`, ?`, len(dead)-1) + `) AND heartbeat_at < ?`
+	removed, err := reclaimTx(tx, cond, append(dead, now-StaleThreshold.Milliseconds()), now)
+	if err != nil {
+		return nil, err
+	}
+	return removed, tx.Commit()
+}
+
+// deleteStaleTx removes abandoned rows - every row for the resource whose
+// heartbeat is older than StaleThreshold - and records them as reclaimTx does.
 //
 // This runs inside TryAcquire's acquisition transaction, so the extra work
 // matters. It is bounded to at most one insert-and-prune per resource: only
 // running rows are recorded, and idx_one_running guarantees there is at most
 // one of those per resource.
 func deleteStaleTx(tx *sql.Tx, resource string, now int64) ([]StaleRemoved, error) {
-	removed, reclaimed, err := takeStaleTx(tx, resource, now)
+	cond, args := `heartbeat_at < ?`, []any{now - StaleThreshold.Milliseconds()}
+	if resource != "" {
+		cond, args = `resource = ? AND heartbeat_at < ?`, append([]any{resource}, args...)
+	}
+	return reclaimTx(tx, cond, args, now)
+}
+
+// reclaimTx deletes the rows matching cond and records the ones that held the
+// resource as OutcomeStale, so a hard-killed workload leaves a trace instead
+// of simply vanishing. Stale *waiting* rows never ran and are not recorded,
+// the same rule Release applies.
+func reclaimTx(tx *sql.Tx, cond string, args []any, now int64) ([]StaleRemoved, error) {
+	removed, reclaimed, err := takeStaleTx(tx, cond, args, now)
 	if err != nil {
 		return nil, err
 	}
@@ -693,20 +782,13 @@ func deleteStaleTx(tx *sql.Tx, resource string, now int64) ([]StaleRemoved, erro
 	return removed, nil
 }
 
-// takeStaleTx deletes the abandoned rows and splits them into what the caller
-// reports and what is worth recording.
-func takeStaleTx(tx *sql.Tx, resource string, now int64) ([]StaleRemoved, []Completion, error) {
-	cutoff := now - StaleThreshold.Milliseconds()
-	const cols = ` RETURNING id, resource, state, IFNULL(label,''), IFNULL(acquired_at,0),
-	          IFNULL(working_directory,''), IFNULL(repository_root,''),
-	          IFNULL(git_branch,''), IFNULL(command_display,'')`
-	q := `DELETE FROM workloads WHERE heartbeat_at < ?` + cols
-	args := []any{cutoff}
-	if resource != "" {
-		q = `DELETE FROM workloads WHERE resource = ? AND heartbeat_at < ?` + cols
-		args = []any{resource, cutoff}
-	}
-	rows, err := tx.Query(q, args...)
+// takeStaleTx deletes the abandoned rows matching cond and splits them into
+// what the caller reports and what is worth recording.
+func takeStaleTx(tx *sql.Tx, cond string, args []any, now int64) ([]StaleRemoved, []Completion, error) {
+	rows, err := tx.Query(`DELETE FROM workloads WHERE `+cond+`
+		RETURNING id, resource, state, IFNULL(label,''), IFNULL(acquired_at,0),
+		          IFNULL(working_directory,''), IFNULL(repository_root,''),
+		          IFNULL(git_branch,''), IFNULL(command_display,'')`, args...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("removing stale workloads: %w", err)
 	}

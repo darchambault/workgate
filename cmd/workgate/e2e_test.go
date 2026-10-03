@@ -484,11 +484,12 @@ func TestMonitorRendersLiveQueue(t *testing.T) {
 		t.Errorf("monitor emitted escape sequences to a pipe:\n%q", text)
 	}
 	// Keys are offered only on a terminal. A piped monitor must not advertise
-	// them, which is the same condition that keeps it unable to mutate anything.
+	// them, which is the same condition that keeps it unable to reorder anything.
 	if strings.Contains(text, "up/down select") {
 		t.Errorf("monitor offered keys on a pipe:\n%s", text)
 	}
-	// Monitoring is read-only: both workloads must still be queued.
+	// The monitor removes only workloads whose owner has exited, and both of
+	// these owners are alive: both must still be queued.
 	if ws := listState(t, d, "monitor-res"); len(ws) != 2 {
 		t.Errorf("monitor changed the queue: %d workloads remain, want 2", len(ws))
 	}
@@ -496,6 +497,54 @@ func TestMonitorRendersLiveQueue(t *testing.T) {
 	m.cmd.Process.Kill()
 	a.cmd.Process.Kill()
 	b.cmd.Process.Kill()
+}
+
+// TestMonitorReclaimsAWorkloadWhoseOwnerWasKilled is the case nothing else
+// would ever clear: a hard-killed owner on a resource nobody runs again. The
+// monitor must move it from RUNNING to LAST COMPLETED on its own, without a
+// run or a status to do it.
+func TestMonitorReclaimsAWorkloadWhoseOwnerWasKilled(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "wg.db")
+	env := append([]string{
+		"WORKGATE_DB=" + dbPath,
+		"WORKGATE_POLL_INTERVAL_MS=100",
+		"WORKGATE_HEARTBEAT_INTERVAL_MS=300",
+		"WORKGATE_STALE_THRESHOLD_MS=2500",
+	}, noConfigEnv(dbPath)...)
+	d := openTestDB(t, dbPath)
+
+	a := startWG(t, dir, env, "run", "orphan-res", "--label", "Killed owner", "--",
+		helperExe, "-sleep", "120s")
+	waitFor(t, 15*time.Second, "A running", func() bool {
+		ws := listState(t, d, "orphan-res")
+		return len(ws) == 1 && ws[0].State == "running"
+	})
+	if err := a.cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	<-a.done
+
+	m := startWG(t, dir, env, "monitor", "orphan-res", "--interval", "200ms")
+	const notice = "(its owner has exited)"
+	waitFor(t, 30*time.Second, "the monitor to reclaim the workload", func() bool {
+		return strings.Contains(m.output(), notice)
+	})
+	if ws := listState(t, d, "orphan-res"); len(ws) != 0 {
+		t.Fatalf("workloads remain after the reclaim notice: %+v", ws)
+	}
+	// The frame that announced the reclaim, up to the notice - which follows
+	// the body, so however the pipe was read, the body before it is whole. The
+	// live section is empty, and the workload has moved to the completions.
+	text := m.output()
+	at := strings.Index(text, notice)
+	frame := text[strings.LastIndex(text[:at], "workgate monitor - orphan-res"):at]
+	for _, want := range []string{"No active workloads for", "LAST COMPLETED", "stale", "Killed owner"} {
+		if !strings.Contains(frame, want) {
+			t.Errorf("reclaiming frame missing %q:\n%s", want, frame)
+		}
+	}
+	m.cmd.Process.Kill()
 }
 
 // TestMonitorRejectsBadArguments covers the usage paths, which must fail fast

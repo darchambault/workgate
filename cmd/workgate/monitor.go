@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"workgate/internal/db"
+	"workgate/internal/proc"
 	"workgate/internal/queue"
 )
 
@@ -38,16 +39,23 @@ const (
 // waiting workload be re-prioritized from the view that shows why it needs to
 // be.
 //
-// Unlike status, monitor never removes a workload: it does not reclaim stale
-// rows, it labels them. Watching a resource should not change who owns it, and
-// abandoned rows are already cleaned up by any run that needs the resource — a
-// monitor left open overnight would otherwise be quietly making decisions
-// about other sessions' workloads.
+// Unlike status, monitor does not reclaim a row merely because its heartbeat
+// is stale. A monitor is left open for hours, across machine sleeps, and after
+// a sleep every heartbeat is stale at once: reclaiming on that alone would
+// have the monitor take a running row from an owner that is only late, and
+// hand the resource to a second workload while the first child still runs.
+// A stale row is labelled instead, and removed only once its owner process is
+// known to have exited — a judgement that a dead process cannot prove wrong.
 //
-// The one thing it does write is a priority, for the row the user selected and
-// only on the keystroke asking for it, through the same single transaction
+// That removal cannot be left to "whoever runs next". A run reclaims only its
+// own resource, and a resource named for one worktree may never be run again:
+// its abandoned row would sit in RUNNING, marked stale, until someone happened
+// to type `workgate status`.
+//
+// The only other thing it writes is a priority, for the row the user selected
+// and only on the keystroke asking for it, through the same single transaction
 // `workgate priority` runs. Keys are live only when both ends are a terminal,
-// so a redirected monitor is still exactly the read-only view it was.
+// so a redirected monitor still cannot reorder anything.
 func cmdMonitor(args []string) int {
 	resource, interval, err := parseMonitorArgs(args)
 	if err != nil {
@@ -95,6 +103,10 @@ func cmdMonitor(args []string) int {
 	if resource != "" {
 		scope = resource
 	}
+	// The host rows are recorded under, which is the only host whose pids this
+	// monitor can judge. If it cannot be read, nothing is judged, and stale
+	// rows are labelled as they always were.
+	host, _ := os.Hostname()
 
 	t := time.NewTicker(interval)
 	defer t.Stop()
@@ -103,8 +115,17 @@ func cmdMonitor(args []string) int {
 	var body []line
 	var workloads []queue.Workload
 	for {
-		read, listErr := queue.List(d, resource)
+		// Before the read, so a reclaimed row leaves RUNNING and appears under
+		// LAST COMPLETED in the same frame.
+		removed, listErr := queue.CleanupAbandoned(d, resource, host, proc.Exited)
+		if len(removed) > 0 {
+			st.say(time.Now(), "%s", reclaimedNotice(removed))
+		}
+		var read []queue.Workload
 		var done []queue.Completion
+		if listErr == nil {
+			read, listErr = queue.List(d, resource)
+		}
 		if listErr == nil {
 			done, listErr = queue.RecentCompletions(d, resource, monitorRecentCount)
 		}
@@ -247,6 +268,20 @@ func applyKey(d *sql.DB, m *monitorState, ws []queue.Workload, k key, now time.T
 	case keyClear:
 		m.selected, m.notice = "", ""
 	}
+}
+
+// reclaimedNotice says what the monitor removed, in the words status uses when
+// it removes the same thing. A row that vanishes between frames otherwise looks
+// like one that finished.
+func reclaimedNotice(rs []queue.StaleRemoved) string {
+	if len(rs) == 1 {
+		return fmt.Sprintf("Removed stale workload %s from %q (its owner has exited)", rs[0].ID, rs[0].Resource)
+	}
+	ids := make([]string, len(rs))
+	for i, r := range rs {
+		ids[i] = r.ID
+	}
+	return fmt.Sprintf("Removed stale workloads %s (their owners have exited)", strings.Join(ids, ", "))
 }
 
 // selectable returns the rows the highlight can land on, in display order.
