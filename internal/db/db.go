@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -98,11 +99,20 @@ CREATE TABLE IF NOT EXISTS workloads (
 	-- makes such a row a workload of its own - the group key everywhere is
 	-- IFNULL(group_id, id). Declared after priority because its migration runs
 	-- after the priority one, and both can only append.
-	group_id          TEXT
+	group_id          TEXT,
+	-- How this row claims its resource. 'exclusive' is what every claim was
+	-- before tags: one holder at a time. 'shared' rows - a --tag - may be held
+	-- by any number of workloads at once, and conflict only with an exclusive
+	-- row on the same resource. NOT NULL DEFAULT 'exclusive' does for an older
+	-- binary what priority's default does: its INSERT does not name the
+	-- column, and the row it writes claims what it always meant to.
+	mode              TEXT NOT NULL DEFAULT 'exclusive' CHECK (mode IN ('exclusive','shared'))
 );
 CREATE INDEX IF NOT EXISTS idx_workloads_resource_seq ON workloads(resource, seq);
 -- Hard correctness backstop: SQLite itself refuses a second 'running' row
--- for the same resource, independent of application logic.
+-- for the same resource, independent of application logic. This is the form
+-- that predates shared claims; migrate replaces it with exclusiveRunningIndex,
+-- which cannot live here - see the note on the constants below.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_running ON workloads(resource) WHERE state = 'running';
 
 -- A small bounded ring of recently finished workloads. This is not history:
@@ -161,6 +171,20 @@ const (
 	// so. idx_workloads_resource_seq stays, because arrival order is still what
 	// orders a level and what List falls back on.
 	priorityIndex = `CREATE INDEX IF NOT EXISTS idx_workloads_resource_priority_seq ON workloads(resource, priority, seq)`
+
+	// How a row claims its resource; see the column in schema.
+	addModeColumn = `ALTER TABLE workloads ADD COLUMN mode TEXT NOT NULL DEFAULT 'exclusive' CHECK (mode IN ('exclusive','shared'))`
+
+	// The single-owner backstop, narrowed to exclusive rows so that several
+	// shared holders of a tag can run at once. What keeps a shared holder and
+	// an exclusive one apart is TryAcquire's one immediate transaction; no
+	// index can say "no exclusive row beside a shared one".
+	//
+	// It keeps the old index's name on purpose. An older binary runs
+	// `CREATE UNIQUE INDEX IF NOT EXISTS idx_one_running` on every open, which
+	// is a no-op while this one exists - under any other name it would try to
+	// build the strict index over two running shared rows, and fail to open.
+	exclusiveRunningIndex = `CREATE UNIQUE INDEX idx_one_running ON workloads(resource) WHERE state = 'running' AND mode = 'exclusive'`
 )
 
 func migrate(d *sql.DB) error {
@@ -177,6 +201,7 @@ func migrate(d *sql.DB) error {
 	}{
 		{"workloads", "priority", addPriorityColumn, []string{priorityIndex}},
 		{"workloads", "group_id", addGroupColumn, nil},
+		{"workloads", "mode", addModeColumn, nil},
 		// No index alongside it: the column is display-only and nothing ever
 		// selects or orders by it.
 		{"completions", "command_display", addCompletionCommand, nil},
@@ -185,7 +210,41 @@ func migrate(d *sql.DB) error {
 			return err
 		}
 	}
-	return nil
+	return narrowRunningIndex(d)
+}
+
+// narrowRunningIndex replaces the original idx_one_running with
+// exclusiveRunningIndex, once. Unlike the steps addColumn runs, this one is
+// not idempotent by itself - CREATE cannot be IF NOT EXISTS when the old index
+// holds the name - so it reads the index's definition first and does nothing
+// once that already names mode. The read and the swap share one immediate
+// transaction, so of several processes opening an old database together,
+// exactly one swaps and the rest see it done.
+//
+// The schema Exec always creates the old form first, on a fresh database as
+// on an old one, so there is a single path here rather than two to keep in
+// step.
+func narrowRunningIndex(d *sql.DB) error {
+	tx, err := d.Begin()
+	if err != nil {
+		return fmt.Errorf("beginning index migration: %w", err)
+	}
+	defer tx.Rollback()
+
+	var def string
+	if err := tx.QueryRow(`SELECT IFNULL(sql,'') FROM sqlite_master
+		WHERE type = 'index' AND name = 'idx_one_running'`).Scan(&def); err != nil {
+		return fmt.Errorf("inspecting idx_one_running: %w", err)
+	}
+	if strings.Contains(def, "mode") {
+		return nil
+	}
+	for _, q := range []string{`DROP INDEX idx_one_running`, exclusiveRunningIndex} {
+		if _, err := tx.Exec(q); err != nil {
+			return fmt.Errorf("narrowing idx_one_running to exclusive rows: %w", err)
+		}
+	}
+	return tx.Commit()
 }
 
 // addColumn adds column to a table that predates it, then runs then.

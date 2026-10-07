@@ -19,6 +19,8 @@ Workloads targeting the same resource run strictly one at a time: the highest
 priority first, and in arrival order within one priority level. Workloads
 targeting different resources run concurrently, and a workload that needs
 several — a project *and* the GPU — names them all and takes them all at once.
+A *tag* groups workloads across resources, so that one of them can ask for the
+others to stay out of its way — a benchmark that needs a quiet machine.
 The resource is released automatically when the wrapped command exits — or,
 if the process is killed outright, recovered automatically via heartbeat
 staleness.
@@ -26,9 +28,10 @@ staleness.
 ## Usage
 
 ```text
-workgate run <resource>[,<resource>...] [--label "<description>"] [--priority <1-5>] -- <command> [args...]
-workgate status [<resource>] [--recent[=<count>]]
-workgate monitor [<resource>] [--interval <duration>]
+workgate run <resource>[,<resource>...] [--label "<description>"] [--priority <1-5>]
+             [--tag <name>]... [--block-tag <name>]... [--block-all] -- <command> [args...]
+workgate status [<resource> | tag:<name>] [--recent[=<count>]]
+workgate monitor [<resource> | tag:<name>] [--interval <duration>]
 workgate priority <id> <1-5>
 ```
 
@@ -39,6 +42,9 @@ workgate priority <id> <1-5>
 - `run` takes up to four resources as a comma-separated list
   (`myproject,gpu`), for a command that needs all of them at once; see
   [Multiple resources](#multiple-resources) below.
+- `--tag` lets any number of workloads share a tag; `--block-tag` runs alone
+  among them, and `--block-all` runs alone among every workload. Each is
+  repeatable; see [Tags](#tags) below.
 - `--label` is diagnostic only. Without it an entry simply has no label: the
   views show the command on a line of its own regardless, and no placeholder
   stands in for the description you did not write.
@@ -187,6 +193,79 @@ workgate run myproject,gpu --label "Train and package" -- python train.py
   name are usage errors (exit `2`).
 - A workload whose owner dies is reclaimed whole: the next `run` on *any* of
   its resources frees all of them, and reports it once.
+
+### Tags
+
+A resource is held by one workload at a time. A **tag** is held by any number
+of them at once — until one asks for it to itself. That is what a benchmark
+needs: not one particular resource, but for the rest of the project's work to
+stay out of the way while it runs.
+
+Say every worktree of a project serializes its own work on a resource named
+after the worktree, and work that needs the GPU names `gpu` as well. Tag all of
+it with the project:
+
+```sh
+workgate run myproject-wt1 --tag myproject --label "Unit tests" -- make test
+workgate run myproject-wt2,gpu --tag myproject --label "Render" -- make render
+```
+
+Those run side by side, each worktree still one job at a time. A benchmark
+claims the tag with `--block-tag` instead:
+
+```sh
+workgate run myproject-wt1 --block-tag myproject --label "Benchmark" -- make bench
+```
+
+- **It waits for what is already in motion.** Tagged work that is running, or
+  that was queued before the benchmark, goes first — including work that is
+  itself still waiting for its own worktree.
+- **It holds back everything behind it, from the moment it is queued.** Tagged
+  work queued after the benchmark does not start, in any worktree, until the
+  benchmark has finished. That is the same head-of-line rule every queue
+  follows (see [Multiple resources](#multiple-resources)), and it is what makes
+  the wait finite: the benchmark cannot be starved by a steady supply of tagged
+  work. The cost is that other worktrees can sit idle while the benchmark still
+  waits for its own.
+- **Tagged work never holds back other tagged work.** Two `--tag` workloads do
+  not wait for each other, even when one of them is still queued behind its own
+  worktree.
+- **Only tagged work is held.** A workload without the tag — or anything run
+  outside workgate — is not affected. A tag is only as quiet as the commands
+  that carry it.
+- **Priority still comes first.** A `--priority 1` tagged workload queued after
+  a level-3 benchmark runs before it, exactly as it would overtake any other
+  waiter.
+- **`--block-all`** is `--block-tag` for every workgate workload, tagged or
+  not: it runs once nothing at all is running, and nothing queued after it
+  starts until it is done. It still names its own resource.
+- Tags are named like resources, are case-insensitive, and live in their own
+  namespace: tag `gpu` and resource `gpu` are unrelated. `--tag` and
+  `--block-tag` are repeatable. A tag given twice, or given to both flags, is a
+  usage error, and tags count toward the limit of four.
+
+`status tag:myproject` shows a tag's queue, with the blocker marked:
+
+```text
+TAG: myproject
+
+RUNNING
+  49ce3e   pid 77900  00:41    P3  myproject-wt2 [render]
+           "Render"
+           also holds: myproject-wt2, gpu
+           make render
+
+WAITING
+  70ce62   pid 51204  00:12    P3  [BLOCKS TAG]  myproject-wt1 [bench]
+           "Benchmark"
+           also waits for: myproject-wt1
+           make bench
+```
+
+Under its worktree the same entry reads `also waits for: tag:myproject
+(blocking)`. A `--block-all` workload is listed under `ALL WORKLOADS
+(--block-all)`, and that section appears in every view of a single queue too,
+since it is in the way of all of them.
 
 ### Monitoring
 
@@ -533,7 +612,7 @@ Add a section like this to each project's `AGENTS.md` / `CLAUDE.md`
 (workgate itself does not depend on these files):
 
 ```markdown
-### Shared exclusive resources
+### Machine-wide resources
 
 Some operations must not execute concurrently with workloads from other
 coding-agent sessions or projects on this machine.
@@ -633,14 +712,16 @@ CREATE TABLE workloads (
   working_directory TEXT, repository_root TEXT, git_common_dir TEXT,
   git_branch        TEXT, command_display TEXT, hostname TEXT,
   priority          INTEGER NOT NULL DEFAULT 3 CHECK (priority BETWEEN 1 AND 5),
-  group_id          TEXT  -- the workload's id on every one of its rows
+  group_id          TEXT, -- the workload's id on every one of its rows
+  mode              TEXT NOT NULL DEFAULT 'exclusive' CHECK (mode IN ('exclusive','shared'))
 );
 CREATE INDEX idx_workloads_resource_seq ON workloads(resource, seq);
 CREATE INDEX idx_workloads_resource_priority_seq ON workloads(resource, priority, seq);
-CREATE UNIQUE INDEX idx_one_running ON workloads(resource) WHERE state = 'running';
+CREATE UNIQUE INDEX idx_one_running ON workloads(resource)
+  WHERE state = 'running' AND mode = 'exclusive';
 ```
 
-`priority` and `group_id` were added after the first release, and need a real
+`priority`, `group_id` and `mode` were added after the first release, and need a real
 migration: `CREATE TABLE IF NOT EXISTS` cannot add a column to a table that
 already exists, so opening an older database runs an `ALTER TABLE` first,
 inside the same immediate transaction that every other write uses. `NOT NULL
@@ -659,6 +740,18 @@ and so waits for a resource a multi-resource workload holds. It does list
 those rows as separate workloads, and its stale cleanup can remove one of
 them; the workload that loses a row then stops, reporting it was removed as
 stale, rather than go on holding the rest.
+
+A tag is a row like any other, on the resource `tag:<name>` — a colon can
+never appear in a resource name — and `--tag` writes it with `mode='shared'`.
+Two rows conflict unless both are shared, and only conflicting rows count
+against each other in the acquisition check. `--block-all` adds one more
+exclusive row, on the resource `*`; a workload that has one conflicts with
+every other workload, whatever either names. Every claim before tags was
+exclusive, so for those the rule is exactly the one it replaced. `idx_one_running`
+is narrowed to exclusive rows so that several shared holders can run; it keeps
+its name so that an older binary, which runs `CREATE UNIQUE INDEX IF NOT EXISTS
+idx_one_running` on every open, leaves it alone. An older binary writes
+exclusive rows, which is the safe side, and never looks for a `*` row.
 
 A second table holds the recent-completions ring. Nothing reads it to make a
 coordination decision; it exists only so `monitor` and `status --recent` can
@@ -685,8 +778,10 @@ CREATE INDEX idx_completions_resource_seq ON completions(resource, seq);
 - `completions.id` is deliberately not unique: a workload id is three random
   bytes, unique only among live rows, and a cosmetic collision must never be
   able to fail a release and strand a resource.
-- The partial unique index makes a second `running` row per resource
-  impossible at the database level, independent of application logic.
+- The partial unique index makes a second `running` exclusive row per resource
+  impossible at the database level, independent of application logic. Keeping
+  a shared holder and an exclusive one apart rests on the acquisition
+  transaction alone; no index can say it.
 - A workload's rows are inserted in one transaction, so their `seq`s are
   consecutive and no other workload's can fall between them. Comparing two
   rows on `(priority, seq)` is then the same as comparing their workloads,
@@ -710,8 +805,8 @@ The lifecycle:
    otherwise quiet.
 3. **Acquire** — one short `BEGIN IMMEDIATE` transaction: delete stale
    workloads on its resources (heartbeat older than 60 s), verify that on
-   every one of them no owner exists and no waiting row outranks this one on
-   `(priority, seq)`, then flip all of its rows to `running`. Atomicity guarantees two processes can
+   every one of them no conflicting owner exists and no conflicting waiting row
+   outranks this one on `(priority, seq)`, then flip all of its rows to `running`. Atomicity guarantees two processes can
    never both win and cleanup can never race acquisition; `seq` is unique, so
    `(priority, seq)` is a strict total order and exactly one waiter can pass
    the rank check. A newer workload can overtake a healthy older waiter only
@@ -816,7 +911,13 @@ them.
 - A multi-resource workload holds its place on every resource it names, even
   one that sits idle while it waits for another. That idle time is the price
   of never starving it; see [Multiple resources](#multiple-resources). It may
-  name at most four.
+  name at most four, tags included.
+- A `--block-tag` holds back only the workloads that carry its tag, and a
+  `--block-all` only workloads run through workgate — and not ones started by
+  a binary that predates it, which does not know to look. Neither one can
+  quiet the rest of the machine. Both hold their place from the moment they
+  are queued, so tagged work in other queues can sit idle while a blocker is
+  still waiting for its own resource; see [Tags](#tags).
 - Deliberately excluded: explicit acquire/release commands, preemption,
   priority aging, retries, daemons, networking, and per-project scopes.
 - There is no history. The recent-completions ring is a display aid, bounded

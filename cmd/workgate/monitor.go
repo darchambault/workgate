@@ -63,7 +63,7 @@ func cmdMonitor(args []string) int {
 		return 2
 	}
 	if resource != "" {
-		if resource, err = queue.ValidateResource(resource); err != nil {
+		if resource, err = queue.ValidateScope(resource); err != nil {
 			fmt.Fprintf(os.Stderr, "workgate: %v\n", err)
 			return 2
 		}

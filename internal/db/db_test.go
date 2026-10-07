@@ -138,8 +138,9 @@ func downgrade(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 	defer d.Close()
-	// group_id goes too: it was added after priority, so a database that
-	// predates priorities predates it as well.
+	// group_id and mode go too: both were added after priority, so a database
+	// that predates priorities predates them as well.
+	downgradeModesOn(t, d)
 	for _, q := range []string{
 		`ALTER TABLE workloads DROP COLUMN group_id`,
 		`DROP INDEX IF EXISTS idx_workloads_resource_priority_seq`,
@@ -362,6 +363,7 @@ func downgradeGroups(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 	defer d.Close()
+	downgradeModesOn(t, d) // added after group_id, so older still
 	if _, err := d.Exec(`ALTER TABLE workloads DROP COLUMN group_id`); err != nil {
 		t.Fatalf("simulating a pre-group schema: %v", err)
 	}
@@ -503,5 +505,203 @@ func TestPriorityCheckRejectsOutOfRange(t *testing.T) {
 				t.Errorf("priority 1 was rejected: %v", err)
 			}
 		})
+	}
+}
+
+// downgradeModes strips the mode column back off and restores the original
+// single-owner index: the shape of a database last opened by a binary from
+// before tags.
+func downgradeModes(t *testing.T, path string) {
+	t.Helper()
+	d, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	downgradeModesOn(t, d)
+}
+
+// downgradeModesOn is downgradeModes on a database that is already open. The
+// index goes first: SQLite refuses to drop a column an index still names.
+func downgradeModesOn(t *testing.T, d *sql.DB) {
+	t.Helper()
+	for _, q := range []string{
+		`DROP INDEX idx_one_running`,
+		`CREATE UNIQUE INDEX idx_one_running ON workloads(resource) WHERE state = 'running'`,
+		`ALTER TABLE workloads DROP COLUMN mode`,
+	} {
+		if _, err := d.Exec(q); err != nil {
+			t.Fatalf("simulating a pre-tag schema (%s): %v", q, err)
+		}
+	}
+}
+
+// runningIndexSQL is the definition idx_one_running currently has.
+func runningIndexSQL(t *testing.T, d *sql.DB) string {
+	t.Helper()
+	var def string
+	if err := d.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_one_running'`).Scan(&def); err != nil {
+		t.Fatalf("reading idx_one_running: %v", err)
+	}
+	return def
+}
+
+// TestSharedRowsMayRunTogether is the other half of the backstop: the index
+// is narrowed to exclusive rows, on a fresh database and on a migrated one
+// alike, so several shared holders of a tag can run while two exclusive
+// owners still cannot.
+func TestSharedRowsMayRunTogether(t *testing.T) {
+	for _, tc := range []struct {
+		desc     string
+		migrated bool
+	}{
+		{"fresh schema", false},
+		{"migrated schema", true},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "workgate.db")
+			if d, err := Open(path); err != nil {
+				t.Fatal(err)
+			} else {
+				d.Close()
+			}
+			if tc.migrated {
+				downgradeModes(t, path)
+			}
+			d, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer d.Close()
+			shared := `INSERT INTO workloads (id, resource, state, created_at, heartbeat_at, mode)
+			           VALUES (?, 'tag:p', 'running', 1, 1, 'shared')`
+			for _, id := range []string{"aaa111", "bbb222"} {
+				if _, err := d.Exec(shared, id); err != nil {
+					t.Fatalf("running shared row %s: %v", id, err)
+				}
+			}
+			exclusive := `INSERT INTO workloads (id, resource, state, created_at, heartbeat_at)
+			              VALUES (?, 'gpu', 'running', 1, 1)`
+			if _, err := d.Exec(exclusive, "ccc333"); err != nil {
+				t.Fatalf("first exclusive row: %v", err)
+			}
+			if _, err := d.Exec(exclusive, "ddd444"); err == nil {
+				t.Fatal("second running exclusive row for the same resource was allowed")
+			}
+			if _, err := d.Exec(`INSERT INTO workloads (id, resource, state, created_at, heartbeat_at, mode)
+			                     VALUES ('eee555', 'gpu', 'waiting', 1, 1, 'sideways')`); err == nil {
+				t.Fatal("an unknown mode was accepted")
+			}
+		})
+	}
+}
+
+// TestModeDefaultsToExclusive pins the compatibility contract for an older
+// binary: its INSERT never names the column, and the row it writes must claim
+// its resource the way it always did.
+func TestModeDefaultsToExclusive(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "workgate.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if _, err := d.Exec(`INSERT INTO workloads (id, resource, state, created_at, heartbeat_at)
+	                     VALUES ('aaa111', 'gpu', 'waiting', 1, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	var mode string
+	if err := d.QueryRow(`SELECT mode FROM workloads WHERE id = 'aaa111'`).Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	if mode != "exclusive" {
+		t.Fatalf("default mode = %q, want exclusive", mode)
+	}
+}
+
+// TestNarrowingTheRunningIndexIsIdempotent: every open runs the migration, and
+// once the index names mode it must be left exactly as it is - including by
+// an older binary, whose schema re-creates idx_one_running only IF NOT EXISTS.
+func TestNarrowingTheRunningIndexIsIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "workgate.db")
+	var defs []string
+	for i := 0; i < 3; i++ {
+		d, err := Open(path)
+		if err != nil {
+			t.Fatalf("open #%d: %v", i+1, err)
+		}
+		defs = append(defs, runningIndexSQL(t, d))
+		if i == 1 {
+			// What an older binary runs on open.
+			if _, err := d.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_one_running ON workloads(resource) WHERE state = 'running'`); err != nil {
+				t.Fatalf("older binary's schema: %v", err)
+			}
+		}
+		d.Close()
+	}
+	for i, def := range defs {
+		if !strings.Contains(def, "mode") {
+			t.Errorf("open #%d: idx_one_running = %q, want it narrowed to exclusive rows", i+1, def)
+		}
+		if def != defs[0] {
+			t.Errorf("open #%d: idx_one_running changed to %q", i+1, def)
+		}
+	}
+}
+
+// TestConcurrentOpenMigratesModesOnce: several sessions can reach a pre-tag
+// database together - with a running row already in it - and none may fail.
+func TestConcurrentOpenMigratesModesOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "workgate.db")
+	if d, err := Open(path); err != nil {
+		t.Fatal(err)
+	} else {
+		d.Close()
+	}
+	downgradeModes(t, path)
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO workloads (id, resource, state, created_at, heartbeat_at)
+	                       VALUES ('aaa111', 'gpu', 'running', 1, 1)`); err != nil {
+		t.Fatalf("seeding a workload: %v", err)
+	}
+	raw.Close()
+
+	const openers = 8
+	errs := make(chan error, openers)
+	var wg sync.WaitGroup
+	for i := 0; i < openers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d, err := Open(path)
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer d.Close()
+			_, err = d.Exec(`SELECT COUNT(*) FROM workloads WHERE mode = 'exclusive'`)
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent open: %v", err)
+		}
+	}
+	d, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	var mode string
+	if err := d.QueryRow(`SELECT mode FROM workloads WHERE id = 'aaa111'`).Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	if mode != "exclusive" {
+		t.Errorf("pre-existing row mode = %q, want exclusive", mode)
 	}
 }

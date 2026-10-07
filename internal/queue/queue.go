@@ -10,6 +10,14 @@
 // workloads can never each hold what the other is waiting for. Rows written
 // by an older binary have no group_id and are a workload of one - which is
 // why the group key everywhere below is IFNULL(group_id, id).
+//
+// A row claims its resource exclusively or shared. Resources named on the
+// command line are exclusive: one holder at a time. A tag (see ValidateTag) is
+// a resource of its own namespace that ordinary workloads claim shared - any
+// number of them hold it at once - and that a workload wanting the others out
+// of the way claims exclusively. Two rows conflict unless both are shared, and
+// only conflicting rows stand in each other's way. A workload with an
+// AllWorkloads row conflicts with every other workload, whatever it names.
 package queue
 
 import (
@@ -76,7 +84,9 @@ type Workload struct {
 	Seq              int64
 	ID               string
 	Resource         string   // this row's resource
+	Mode             string   // how this row claims it: ModeExclusive or ModeShared
 	Resources        []string // every resource of the workload, in the order named
+	Modes            []string // how each of Resources is claimed; nil means all exclusive
 	Label            string
 	State            string
 	Priority         int // 1 (highest) .. 5 (lowest)
@@ -183,10 +193,52 @@ const (
 	PriorityLowest  = 5
 )
 
-// MaxResources is how many resources one workload may name. Generous for real
-// use - a project, a GPU, a toolchain seat - and small enough that an entry's
-// "also holds" line stays readable.
+// MaxResources is how many resources one workload may name, tags included.
+// Generous for real use - a project, a GPU, a tag - and small enough that an
+// entry's "also holds" line stays readable. The AllWorkloads marker is not
+// counted: it is a flag on the workload, not something it names.
 const MaxResources = 4
+
+// How a row claims its resource. The strings are what the mode column holds.
+const (
+	ModeExclusive = "exclusive"
+	ModeShared    = "shared"
+)
+
+// TagPrefix starts the resource name a tag is stored under. resourceRe can
+// never match a colon, so no resource can collide with a tag, and a tag is
+// still a row like any other: queued, ranked, reclaimed and listed by the same
+// code.
+const TagPrefix = "tag:"
+
+// AllWorkloads is the resource a --block-all workload claims exclusively. It
+// is not a queue anyone else joins: what makes it block everything is
+// blockedQuery, which treats a workload holding it as conflicting with every
+// other workload. "*" can be neither a resource nor a tag name.
+const AllWorkloads = "*"
+
+// Claim is one resource a workload asks for, and how.
+type Claim struct {
+	Resource string
+	Shared   bool
+}
+
+func (c Claim) mode() string {
+	if c.Shared {
+		return ModeShared
+	}
+	return ModeExclusive
+}
+
+// Exclusive claims every one of resources exclusively, which is how every
+// resource named on the command line is claimed.
+func Exclusive(resources []string) []Claim {
+	out := make([]Claim, len(resources))
+	for i, r := range resources {
+		out[i] = Claim{Resource: r}
+	}
+	return out
+}
 
 // groupKey is the SQL expression for the workload a row belongs to. See the
 // package comment: rows from older binaries have no group_id.
@@ -220,6 +272,27 @@ func ValidateResource(name string) (string, error) {
 		return "", fmt.Errorf("invalid resource name %q: must match [a-zA-Z0-9][a-zA-Z0-9._-]*", name)
 	}
 	return name, nil
+}
+
+// ValidateTag normalizes a tag name exactly as ValidateResource does a
+// resource name, and returns the resource the tag is stored under.
+func ValidateTag(name string) (string, error) {
+	n, err := ValidateResource(name)
+	if err != nil {
+		return "", fmt.Errorf("invalid tag: %w", err)
+	}
+	return TagPrefix + n, nil
+}
+
+// ValidateScope normalizes what status and monitor accept to narrow their
+// view: a resource name, or a tag written the way the views print it,
+// "tag:<name>".
+func ValidateScope(name string) (string, error) {
+	n := strings.ToLower(strings.TrimSpace(name))
+	if strings.HasPrefix(n, TagPrefix) {
+		return ValidateTag(strings.TrimPrefix(n, TagPrefix))
+	}
+	return ValidateResource(name)
 }
 
 // ValidateResources parses a comma-separated resource list, as `run` takes it.
@@ -315,11 +388,26 @@ func newID() string {
 // runs next. An invalid level is an error, never silently clamped: a zero
 // value here means a caller forgot, not that it wanted PriorityDefault.
 func Enqueue(d *sql.DB, resources []string, priority int, meta Meta) (*Workload, error) {
+	return EnqueueClaims(d, Exclusive(resources), priority, meta)
+}
+
+// EnqueueClaims is Enqueue for a workload that claims some of its resources
+// shared - tags - or that blocks every other workload with an AllWorkloads
+// claim. Claims are stored, and reported, in the order given.
+func EnqueueClaims(d *sql.DB, claims []Claim, priority int, meta Meta) (*Workload, error) {
 	if err := checkPriority(priority); err != nil {
 		return nil, err
 	}
-	if len(resources) == 0 || len(resources) > MaxResources {
-		return nil, fmt.Errorf("enqueueing workload: %d resources, want 1 to %d", len(resources), MaxResources)
+	named := 0
+	for _, c := range claims {
+		if c.Resource != AllWorkloads {
+			named++
+		} else if c.Shared {
+			return nil, errors.New("enqueueing workload: the all-workloads claim cannot be shared")
+		}
+	}
+	if named == 0 || named > MaxResources {
+		return nil, fmt.Errorf("enqueueing workload: %d resources, want 1 to %d", named, MaxResources)
 	}
 	tx, err := d.Begin()
 	if err != nil {
@@ -330,21 +418,24 @@ func Enqueue(d *sql.DB, resources []string, priority int, meta Meta) (*Workload,
 	now := nowMillis()
 	var group string
 	var headSeq int64
-	for _, resource := range resources {
-		id, seq, err := insertRow(tx, resource, group, priority, meta, now)
+	resources := make([]string, len(claims))
+	modes := make([]string, len(claims))
+	for i, c := range claims {
+		id, seq, err := insertRow(tx, c.Resource, c.mode(), group, priority, meta, now)
 		if err != nil {
 			return nil, err
 		}
 		if group == "" {
 			group, headSeq = id, seq
 		}
+		resources[i], modes[i] = c.Resource, c.mode()
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("committing enqueue: %w", err)
 	}
 	return &Workload{
-		Seq: headSeq, ID: group, Resource: resources[0],
-		Resources: append([]string(nil), resources...), Label: meta.Label,
+		Seq: headSeq, ID: group, Resource: resources[0], Mode: modes[0],
+		Resources: resources, Modes: modes, Label: meta.Label,
 		State: "waiting", Priority: priority, PID: int64(meta.PID),
 		CreatedAt: now, HeartbeatAt: now,
 	}, nil
@@ -352,7 +443,7 @@ func Enqueue(d *sql.DB, resources []string, priority int, meta Meta) (*Workload,
 
 // insertRow writes one waiting row. An empty group makes this the first row of
 // its workload, whose own id becomes the group.
-func insertRow(tx *sql.Tx, resource, group string, priority int, meta Meta, now int64) (string, int64, error) {
+func insertRow(tx *sql.Tx, resource, mode, group string, priority int, meta Meta, now int64) (string, int64, error) {
 	for attempt := 0; ; attempt++ {
 		id := newID()
 		g := group
@@ -363,11 +454,11 @@ func insertRow(tx *sql.Tx, resource, group string, priority int, meta Meta, now 
 			INSERT INTO workloads
 				(id, resource, label, state, pid, created_at, heartbeat_at,
 				 working_directory, repository_root, git_common_dir, git_branch,
-				 command_display, hostname, priority, group_id)
-			VALUES (?, ?, ?, 'waiting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				 command_display, hostname, priority, group_id, mode)
+			VALUES (?, ?, ?, 'waiting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			id, resource, meta.Label, meta.PID, now, now,
 			meta.WorkingDirectory, meta.RepositoryRoot, meta.GitCommonDir,
-			meta.GitBranch, meta.CommandDisplay, meta.Hostname, priority, g)
+			meta.GitBranch, meta.CommandDisplay, meta.Hostname, priority, g, mode)
 		if err != nil {
 			if attempt < 3 && strings.Contains(err.Error(), "UNIQUE") {
 				continue // improbable id collision; retry with a fresh id
@@ -390,20 +481,38 @@ func (w *Workload) resources() []string {
 	return []string{w.Resource}
 }
 
+// conflicts is the SQL condition under which row t, of another workload, can
+// stand in the way of row me. Two rows conflict when they are on the same
+// resource and not both shared, and a workload holding the AllWorkloads marker
+// conflicts with every other workload on every row - in both directions, so a
+// --block-all waits for everything ahead of it and holds back everything
+// behind it.
+//
+// Every claim was exclusive before tags, and then this is exactly the
+// same-resource rule it replaces. The workloads are told apart by group rather
+// than by row id because the AllWorkloads clauses match rows on different
+// resources, where a workload's own rows would otherwise meet.
+const conflicts = `IFNULL(t.group_id, t.id) <> IFNULL(me.group_id, me.id)
+   AND ( ( t.resource = me.resource AND (me.mode = 'exclusive' OR t.mode = 'exclusive') )
+      OR me.resource = '` + AllWorkloads + `' OR t.resource = '` + AllWorkloads + `' )`
+
 // placesQuery ranks each row of one workload against everything queued for
 // that row's resource, in exactly the order List displays and TryAcquire
 // enforces: the running workload first - it holds the resource whatever its
 // priority, because workgate never preempts - then by priority, then by
-// arrival.
+// arrival. Only workloads that conflict with the row count: a shared holder of
+// a tag is not in the way of another, and a --block-all is in the way of
+// everything.
 //
 // Counting the running row explicitly is the part that is easy to get wrong. A
 // plain (priority, seq) comparison would rank a waiting level-1 row above a
 // running level-3 one and report position 1 to a workload that is in fact
-// blocked behind it.
+// blocked behind it. Workloads are counted, not rows: under the AllWorkloads
+// rule one workload can conflict through several of its rows.
 const placesQuery = `
 SELECT me.resource, (
-       SELECT COUNT(*) + 1 FROM workloads t
-        WHERE t.resource = me.resource AND t.id <> me.id
+       SELECT COUNT(DISTINCT IFNULL(t.group_id, t.id)) + 1 FROM workloads t
+        WHERE ` + conflicts + `
           AND ( t.state = 'running'
              OR ( me.state = 'waiting'
                   AND ( t.priority < me.priority
@@ -461,13 +570,17 @@ func Positions(d *sql.DB, w *Workload) ([]Place, error) {
 }
 
 // blockedQuery counts what stands between a waiting workload and all of its
-// resources: on any resource it names, a running row, or a waiting row that
-// outranks this workload's row there on (priority, seq). The workload's own
-// rows never count against each other - each is on a different resource.
+// resources: any conflicting row (see conflicts) that is running, or that is
+// waiting and outranks this workload's row on (priority, seq). The workload's
+// own rows never count against each other.
+//
+// Comparing rows on different resources - which the AllWorkloads rule does -
+// is still comparing workloads: Enqueue keeps a workload's seqs consecutive,
+// and TryAcquire keeps its rows at one priority.
 const blockedQuery = `
 SELECT COUNT(*)
   FROM workloads me JOIN workloads t
-    ON t.resource = me.resource AND t.id <> me.id
+    ON ` + conflicts + `
  WHERE IFNULL(me.group_id, me.id) = ?
    AND ( t.state = 'running'
       OR ( t.state = 'waiting'
@@ -480,17 +593,19 @@ SELECT COUNT(*)
 //  1. deletes stale workloads touching w's resources (returned for
 //     diagnostics);
 //  2. verifies w still has a row for every resource it named;
-//  3. verifies that, on every one of those resources, nothing is running and
-//     no waiting workload outranks w, where rank is (priority, seq): the
-//     lower priority number first, arrival order within a level;
+//  3. verifies that, on every one of those resources, nothing that conflicts
+//     with w's claim is running and no conflicting waiting workload outranks
+//     w, where rank is (priority, seq): the lower priority number first,
+//     arrival order within a level;
 //  4. claims all of them.
 //
 // Because all four steps commit atomically, two processes can never both
 // conclude "the resource is free and I am next", and stale cleanup cannot race
 // acquisition. seq is unique, so (priority, seq) is a strict total order and
-// exactly one waiter can pass step 3 on any resource. The partial unique index
-// on (resource) WHERE state='running' additionally enforces single ownership
-// at the database level.
+// of the waiters that conflict on a resource, exactly one can pass step 3. The
+// partial unique index on (resource) WHERE the row is running and exclusive
+// additionally enforces single exclusive ownership at the database level;
+// keeping shared and exclusive holders apart rests on this transaction alone.
 //
 // Several resources are taken all at once or not at all, so a waiting
 // workload holds nothing - the condition that rules out deadlock. And because
@@ -499,9 +614,18 @@ SELECT COUNT(*)
 // the best-ranked waiter of all is first in every queue it is in.
 //
 // That ordering is strict head-of-line. A waiter blocks everything ranked
-// behind it on every resource it names, including one that is idle while it
-// waits for another: letting later work take the idle one would let a stream
-// of single-resource work starve a multi-resource workload indefinitely.
+// behind it that it conflicts with, on every resource it names, including one
+// that is idle while it waits for another: letting later work take the idle
+// one would let a stream of single-resource work starve a multi-resource
+// workload indefinitely. This is what makes a --block-tag a hold: from the
+// moment it is queued, tagged work queued after it waits, while what is
+// already running, or queued ahead of it, finishes first.
+//
+// Rows that do not conflict do not hold each other back, even while one of
+// them waits: a shared tag holder queued behind its own busy resource does not
+// stop a later holder of the same tag, or one tag would chain every queue that
+// uses it into one. Liveness is unaffected - the best-ranked waiter of all is
+// still blocked only by what is running.
 //
 // Ordering is strict priority, not FIFO: a newly arrived workload can overtake
 // an older healthy waiter, but only by having a higher priority (a lower
@@ -947,8 +1071,11 @@ func CleanupAbandoned(d *sql.DB, resource, host string, exited func(pid int, enq
 //
 // This runs inside TryAcquire's acquisition transaction, so the extra work
 // matters. It is bounded to one insert-and-prune per running row reclaimed:
-// only running rows are recorded, idx_one_running allows one of those per
-// resource, and a workload has at most MaxResources rows.
+// only running rows are recorded, idx_one_running allows one exclusive one per
+// resource, and a workload has at most MaxResources rows besides its
+// AllWorkloads marker. Shared holders of a tag are the exception - any number
+// can be running - but each is a whole workload that stopped heartbeating, and
+// reclaiming them is the work there is to do.
 func deleteStaleTx(tx *sql.Tx, resources []string, now int64) ([]StaleRemoved, error) {
 	inner := `SELECT ` + groupKey + ` FROM workloads WHERE heartbeat_at < ?`
 	args := []any{now - StaleThreshold.Milliseconds()}
@@ -1017,9 +1144,10 @@ func takeStaleTx(tx *sql.Tx, cond string, args []any, now int64) ([]StaleRemoved
 	return removed, reclaimed, rows.Err()
 }
 
-// List returns current workloads (all resources if resource is empty), in the
-// order they will use their resource: by resource, then running before
-// waiting, then priority, then arrival. Display order and acquisition order
+// List returns current workloads (all resources if resource is empty, and
+// always including any --block-all), in the order they will use their
+// resource: by resource, then running before waiting, then priority, then
+// arrival. Several shared holders of a tag can all be running at once. Display order and acquisition order
 // are the same order deliberately - a view that sorted differently from
 // TryAcquire would misreport who runs next.
 //
@@ -1029,10 +1157,10 @@ func takeStaleTx(tx *sql.Tx, cond string, args []any, now int64) ([]StaleRemoved
 // which is how a view of one queue knows what else the entry holds.
 func List(d *sql.DB, resource string) ([]Workload, error) {
 	// The window runs over the whole table before the outer WHERE narrows it.
-	q := `SELECT seq, gid, resource, label, state, pid, created_at, acquired_at,
+	q := `SELECT seq, gid, resource, mode, label, state, pid, created_at, acquired_at,
 	             heartbeat_at, working_directory, repository_root, git_common_dir,
-	             git_branch, command_display, hostname, priority, members
-	      FROM (SELECT seq, ` + groupKey + ` AS gid, resource, IFNULL(label,'') AS label,
+	             git_branch, command_display, hostname, priority, members, member_modes
+	      FROM (SELECT seq, ` + groupKey + ` AS gid, resource, mode, IFNULL(label,'') AS label,
 	                   state, IFNULL(pid,0) AS pid, created_at,
 	                   IFNULL(acquired_at,0) AS acquired_at, heartbeat_at,
 	                   IFNULL(working_directory,'') AS working_directory,
@@ -1043,11 +1171,17 @@ func List(d *sql.DB, resource string) ([]Workload, error) {
 	                   IFNULL(hostname,'') AS hostname, priority,
 	                   group_concat(resource, ',') OVER (
 	                       PARTITION BY ` + groupKey + ` ORDER BY seq
-	                       ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS members
+	                       ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS members,
+	                   group_concat(mode, ',') OVER (
+	                       PARTITION BY ` + groupKey + ` ORDER BY seq
+	                       ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS member_modes
 	            FROM workloads)`
 	var args []any
 	if resource != "" {
-		q += ` WHERE resource = ?`
+		// A --block-all is in the way of every queue, so a view of one queue
+		// lists it too: without it, a waiter there would be stuck behind
+		// something the view does not show.
+		q += ` WHERE resource = ? OR resource = '` + AllWorkloads + `'`
 		args = append(args, resource)
 	}
 	q += ` ORDER BY resource, CASE state WHEN 'running' THEN 0 ELSE 1 END, priority, seq`
@@ -1059,14 +1193,15 @@ func List(d *sql.DB, resource string) ([]Workload, error) {
 	var out []Workload
 	for rows.Next() {
 		var w Workload
-		var members string
-		if err := rows.Scan(&w.Seq, &w.ID, &w.Resource, &w.Label, &w.State, &w.PID,
+		var members, modes string
+		if err := rows.Scan(&w.Seq, &w.ID, &w.Resource, &w.Mode, &w.Label, &w.State, &w.PID,
 			&w.CreatedAt, &w.AcquiredAt, &w.HeartbeatAt,
 			&w.WorkingDirectory, &w.RepositoryRoot, &w.GitCommonDir, &w.GitBranch,
-			&w.CommandDisplay, &w.Hostname, &w.Priority, &members); err != nil {
+			&w.CommandDisplay, &w.Hostname, &w.Priority, &members, &modes); err != nil {
 			return nil, fmt.Errorf("reading workload row: %w", err)
 		}
 		w.Resources = strings.Split(members, ",")
+		w.Modes = strings.Split(modes, ",")
 		out = append(out, w)
 	}
 	return out, rows.Err()

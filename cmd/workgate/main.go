@@ -1,7 +1,8 @@
 // Command workgate provides machine-global, named, exclusive execution of
 // locally launched workloads, ordered by priority and then by arrival:
 //
-//	workgate run <resource>[,<resource>...] [--label "<text>"] [--priority <1-5>] -- <command> [args...]
+//	workgate run <resource>[,<resource>...] [--label "<text>"] [--priority <1-5>]
+//	             [--tag <name>]... [--block-tag <name>]... [--block-all] -- <command> [args...]
 //	workgate status [<resource>]
 //	workgate monitor [<resource>] [--interval <duration>]
 //	workgate priority <id> <1-5>
@@ -28,7 +29,8 @@ import (
 const usage = `workgate - machine-global exclusive execution of local workloads
 
 Usage:
-  workgate run <resource>[,<resource>...] [--label "<description>"] [--priority <1-5>] -- <command> [args...]
+  workgate run <resource>[,<resource>...] [--label "<description>"] [--priority <1-5>]
+               [--tag <name>]... [--block-tag <name>]... [--block-all] -- <command> [args...]
   workgate status [<resource>] [--recent[=<count>]]
   workgate monitor [<resource>] [--interval <duration>]
   workgate priority <id> <1-5>
@@ -41,6 +43,13 @@ automatically when the wrapped command exits.
 A comma-separated list names up to 4 resources a command needs together
 ("run myproject,gpu"). It waits holding none of them and takes them all at
 once, so two such commands can never deadlock.
+
+A tag groups workloads across resources. Any number of "--tag myproject"
+workloads run at once; a "--block-tag myproject" workload runs alone among
+them. From the moment it is queued, tagged work queued after it waits, while
+tagged work already running, or queued ahead of it, finishes first.
+"--block-all" does the same for every workgate workload, tagged or not. Tags
+count toward the limit of 4; "status tag:myproject" shows one.
 
 Priority runs from 1 (highest) to 5 (lowest) and defaults to 3. A higher
 priority overtakes workloads that are still waiting, but never interrupts one
@@ -106,19 +115,24 @@ func fail(err error) int {
 }
 
 func cmdRun(args []string) int {
-	resourceArg, label, priorityArg, argv, err := parseRunArgs(args)
+	r, err := parseRunArgs(args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "workgate: %v\n\n%s", err, usage)
 		return 2
 	}
-	resources, err := queue.ValidateResources(resourceArg)
+	label, argv := r.label, r.argv
+	claims, err := runClaims(r)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "workgate: %v\n", err)
 		return 2
 	}
+	resources := make([]string, len(claims))
+	for i, c := range claims {
+		resources[i] = displayResource(c.Resource)
+	}
 	priority := queue.PriorityDefault
-	if priorityArg != "" {
-		if priority, err = queue.ValidatePriority(priorityArg); err != nil {
+	if r.priority != "" {
+		if priority, err = queue.ValidatePriority(r.priority); err != nil {
 			fmt.Fprintf(os.Stderr, "workgate: %v\n", err)
 			return 2
 		}
@@ -147,7 +161,7 @@ func cmdRun(args []string) int {
 		Hostname:         info.Hostname,
 	}
 
-	w, err := queue.Enqueue(d, resources, priority, meta)
+	w, err := queue.EnqueueClaims(d, claims, priority, meta)
 	if err != nil {
 		return fail(err)
 	}
@@ -275,7 +289,7 @@ func cmdStatus(args []string) int {
 		return 2
 	}
 	if resource != "" {
-		if resource, err = queue.ValidateResource(resource); err != nil {
+		if resource, err = queue.ValidateScope(resource); err != nil {
 			fmt.Fprintf(os.Stderr, "workgate: %v\n", err)
 			return 2
 		}
@@ -429,7 +443,7 @@ func selectedStatusLines(workloads []queue.Workload, now int64, flagStale bool, 
 		if i > 0 {
 			out = append(out, plainLine(""))
 		}
-		out = append(out, styledLine(styleBold, fmt.Sprintf("RESOURCE: %s", res)))
+		out = append(out, styledLine(styleBold, sectionHeading(res)))
 		section := ""
 		for _, w := range byResource[res] {
 			header, style := "WAITING", styleWaiting
@@ -465,6 +479,12 @@ func selectedStatusLines(workloads []queue.Workload, now int64, flagStale bool, 
 			if flagStale && now-w.HeartbeatAt > queue.StaleThreshold.Milliseconds() {
 				entry = append(entry, span{text: "  [STALE]", style: styleAlert})
 			}
+			// In a tag's section the one entry that matters most is the one
+			// holding everyone else back, and its row says so in words. The
+			// all-workloads section needs no marker: every entry there blocks.
+			if w.Mode == queue.ModeExclusive && strings.HasPrefix(w.Resource, queue.TagPrefix) {
+				entry = append(entry, span{text: "  [BLOCKS TAG]", style: styleBold})
+			}
 			if p := displayContext(w); p != "" {
 				entry = append(entry, span{text: "  " + p})
 			}
@@ -473,7 +493,7 @@ func selectedStatusLines(workloads []queue.Workload, now int64, flagStale bool, 
 			if w.State == "running" {
 				also = "also holds: "
 			}
-			out = append(out, continuationLines(w.Label, alsoLine(also, w.Resource, w.Resources), w.CommandDisplay)...)
+			out = append(out, continuationLines(w.Label, alsoLine(also, w.Resource, claimNames(w)), w.CommandDisplay)...)
 		}
 	}
 	return out
@@ -515,7 +535,7 @@ func completionLines(cs []queue.Completion, now int64, showResource bool) []line
 		// the resource column names them all - in the form `run` took them,
 		// so it reads as the workload rather than as a sentence.
 		if showResource {
-			entry = append(entry, span{text: "  " + strings.Join(completionResources(c), ",")})
+			entry = append(entry, span{text: "  " + strings.Join(displayResources(completionResources(c)), ",")})
 		}
 		context := displayContextOf(c.RepositoryRoot, c.WorkingDirectory, c.GitBranch)
 		agoText := fmtAgo(time.Duration(now-c.FinishedAt) * time.Millisecond)
@@ -618,6 +638,56 @@ func alsoLine(prefix, resource string, resources []string) string {
 		return ""
 	}
 	return prefix + strings.Join(others, ", ")
+}
+
+// sectionHeading names a section of the live view: a resource, a tag, or the
+// queue every --block-all waits in.
+func sectionHeading(resource string) string {
+	switch {
+	case resource == queue.AllWorkloads:
+		return "ALL WORKLOADS (--block-all)"
+	case strings.HasPrefix(resource, queue.TagPrefix):
+		return "TAG: " + strings.TrimPrefix(resource, queue.TagPrefix)
+	}
+	return "RESOURCE: " + resource
+}
+
+// displayResource names a resource the way messages and the "also" lines
+// do. A tag keeps its prefix - "tag:p" is also what status takes to show it -
+// and the AllWorkloads marker, which nobody types, is spelled out.
+func displayResource(resource string) string {
+	if resource == queue.AllWorkloads {
+		return "all workloads"
+	}
+	return resource
+}
+
+// displayResources is displayResource over a list.
+func displayResources(resources []string) []string {
+	out := make([]string, len(resources))
+	for i, r := range resources {
+		out[i] = displayResource(r)
+	}
+	return out
+}
+
+// claimNames is every resource of w as its "also" line names it, with the
+// claims that hold others back marked: a tag it blocks, and --block-all.
+// Shared tags and plain resources read as they always have.
+func claimNames(w queue.Workload) []string {
+	out := make([]string, len(w.Resources))
+	for i, r := range w.Resources {
+		name := displayResource(r)
+		blocking := i < len(w.Modes) && w.Modes[i] == queue.ModeExclusive
+		if blocking && (r == queue.AllWorkloads || strings.HasPrefix(r, queue.TagPrefix)) {
+			name += " (blocking)"
+		}
+		if r == w.Resource {
+			name = r // what alsoLine leaves out is the section's own resource
+		}
+		out[i] = name
+	}
+	return out
 }
 
 // completionResources is every resource a completion's workload held. A
@@ -798,59 +868,141 @@ func fmtElapsed(d time.Duration) string {
 	return fmt.Sprintf("%02d:%02d", s/60, s%60)
 }
 
+// runArgs is what `run` was given, as written: values are validated by the
+// caller, not by parseRunArgs.
+type runArgs struct {
+	resource  string // the comma-separated resource list
+	label     string
+	priority  string
+	tags      []string // --tag, in the order given
+	blockTags []string // --block-tag, in the order given
+	blockAll  bool
+	argv      []string
+}
+
 // parseRunArgs parses:
-// <resource> [--label <text>] [--priority <1-5>] -- <command> [args...]
+// <resource> [--label <text>] [--priority <1-5>] [--tag <name>]...
+// [--block-tag <name>]... [--block-all] -- <command> [args...]
 //
-// The priority is returned as written and validated by the caller, exactly as
-// the resource is: this function decides what is a flag, not what is a legal
-// value. Everything after "--" is the child's argv, including a --priority the
-// child itself takes.
-func parseRunArgs(args []string) (resource, label, priority string, argv []string, err error) {
-	// Named results make a five-value error return unreadable at each site.
-	bad := func(err error) (string, string, string, []string, error) {
-		return "", "", "", nil, err
+// The priority and the tags are returned as written and validated by the
+// caller, exactly as the resource is: this function decides what is a flag,
+// not what is a legal value. Everything after "--" is the child's argv,
+// including a --priority the child itself takes.
+func parseRunArgs(args []string) (runArgs, error) {
+	var r runArgs
+	bad := func(err error) (runArgs, error) { return runArgs{}, err }
+	// value reads the flag at args[i], in either "--flag value" or
+	// "--flag=value" form, and reports how many arguments it spent.
+	value := func(i int, flag string) (string, int, bool, error) {
+		a := args[i]
+		if a == flag {
+			if i+1 >= len(args) {
+				return "", 0, true, fmt.Errorf("%s requires a value", flag)
+			}
+			return args[i+1], 2, true, nil
+		}
+		if strings.HasPrefix(a, flag+"=") {
+			return strings.TrimPrefix(a, flag+"="), 1, true, nil
+		}
+		return "", 0, false, nil
 	}
 	i := 0
 	for i < len(args) {
 		a := args[i]
-		switch {
-		case a == "--":
-			argv = args[i+1:]
-			if len(argv) == 0 {
+		if a == "--" {
+			r.argv = args[i+1:]
+			if len(r.argv) == 0 {
 				return bad(errors.New("no command given after --"))
 			}
-			if resource == "" {
+			if r.resource == "" {
 				return bad(errors.New("missing resource name"))
 			}
-			return resource, label, priority, argv, nil
-		case a == "--label":
-			if i+1 >= len(args) {
-				return bad(errors.New("--label requires a value"))
-			}
-			label = args[i+1]
-			i += 2
-		case strings.HasPrefix(a, "--label="):
-			label = strings.TrimPrefix(a, "--label=")
+			return r, nil
+		}
+		if a == "--block-all" {
+			r.blockAll = true
 			i++
-		case a == "--priority":
-			if i+1 >= len(args) {
-				return bad(errors.New("--priority requires a value"))
+			continue
+		}
+		matched := false
+		for _, f := range []struct {
+			flag string
+			set  func(string)
+		}{
+			{"--label", func(v string) { r.label = v }},
+			{"--priority", func(v string) { r.priority = v }},
+			{"--tag", func(v string) { r.tags = append(r.tags, v) }},
+			{"--block-tag", func(v string) { r.blockTags = append(r.blockTags, v) }},
+		} {
+			v, n, ok, err := value(i, f.flag)
+			if err != nil {
+				return bad(err)
 			}
-			priority = args[i+1]
-			i += 2
-		case strings.HasPrefix(a, "--priority="):
-			priority = strings.TrimPrefix(a, "--priority=")
-			i++
+			if ok {
+				f.set(v)
+				i += n
+				matched = true
+				break
+			}
+		}
+		switch {
+		case matched:
 		case strings.HasPrefix(a, "-"):
 			return bad(fmt.Errorf("unknown flag %q", a))
-		case resource == "":
-			resource = a
+		case r.resource == "":
+			r.resource = a
 			i++
 		default:
 			return bad(fmt.Errorf("unexpected argument %q (child command must follow --)", a))
 		}
 	}
 	return bad(errors.New("missing -- before the command to run"))
+}
+
+// runClaims turns what `run` was given into the claims it enqueues: the
+// resources exclusively, in the order named, then the tags shared, then the
+// blocked tags exclusively, then - for --block-all - the AllWorkloads marker.
+//
+// The rules ValidateResources applies to the list apply across all of them: a
+// tag given twice, or given to both --tag and --block-tag, is a typing mistake
+// rather than something to merge, and the limit counts tags too.
+func runClaims(r runArgs) ([]queue.Claim, error) {
+	resources, err := queue.ValidateResources(r.resource)
+	if err != nil {
+		return nil, err
+	}
+	claims := queue.Exclusive(resources)
+	seen := map[string]string{}
+	for _, t := range []struct {
+		flag   string
+		names  []string
+		shared bool
+	}{
+		{"--tag", r.tags, true},
+		{"--block-tag", r.blockTags, false},
+	} {
+		for _, n := range t.names {
+			tag, err := queue.ValidateTag(n)
+			if err != nil {
+				return nil, err
+			}
+			if prev, dup := seen[tag]; dup {
+				if prev == t.flag {
+					return nil, fmt.Errorf("tag %q is given twice", strings.TrimPrefix(tag, queue.TagPrefix))
+				}
+				return nil, fmt.Errorf("tag %q is given to both --tag and --block-tag", strings.TrimPrefix(tag, queue.TagPrefix))
+			}
+			seen[tag] = t.flag
+			claims = append(claims, queue.Claim{Resource: tag, Shared: t.shared})
+		}
+	}
+	if len(claims) > queue.MaxResources {
+		return nil, fmt.Errorf("too many resources and tags: a workload may name at most %d", queue.MaxResources)
+	}
+	if r.blockAll {
+		claims = append(claims, queue.Claim{Resource: queue.AllWorkloads})
+	}
+	return claims, nil
 }
 
 // parsePriorityArgs parses: <id> <1-5>
@@ -902,7 +1054,7 @@ func quoteList(resources []string) string {
 func fmtPlaces(places []queue.Place) string {
 	parts := make([]string, len(places))
 	for i, p := range places {
-		parts[i] = fmt.Sprintf("%q (position %d)", p.Resource, p.Position)
+		parts[i] = fmt.Sprintf("%q (position %d)", displayResource(p.Resource), p.Position)
 	}
 	return andList(parts)
 }
@@ -919,7 +1071,7 @@ func positionText(places []queue.Place) string {
 	}
 	parts := make([]string, len(places))
 	for i, p := range places {
-		parts[i] = fmt.Sprintf("%d on %q", p.Position, p.Resource)
+		parts[i] = fmt.Sprintf("%d on %q", p.Position, displayResource(p.Resource))
 	}
 	return "position " + strings.Join(parts, ", ")
 }
@@ -929,7 +1081,7 @@ func positionText(places []queue.Place) string {
 func stillWaiting(places []queue.Place, waited time.Duration) string {
 	if len(places) == 1 {
 		return fmt.Sprintf("Still waiting for %q (position %d, %s elapsed)",
-			places[0].Resource, places[0].Position, fmtElapsed(waited))
+			displayResource(places[0].Resource), places[0].Position, fmtElapsed(waited))
 	}
 	return fmt.Sprintf("Still waiting for %s; %s elapsed", fmtPlaces(places), fmtElapsed(waited))
 }
@@ -953,7 +1105,7 @@ func staleByWorkload(rs []queue.StaleRemoved) (ids []string, from map[string][]s
 		if _, seen := from[r.ID]; !seen {
 			ids = append(ids, r.ID)
 		}
-		from[r.ID] = append(from[r.ID], r.Resource)
+		from[r.ID] = append(from[r.ID], displayResource(r.Resource))
 	}
 	return ids, from
 }

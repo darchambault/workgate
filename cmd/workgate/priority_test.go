@@ -172,7 +172,8 @@ func TestParseRunArgs(t *testing.T) {
 		{name: "no resource", args: []string{"--", "tool"}, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			resource, label, prio, argv, err := parseRunArgs(tc.args)
+			r, err := parseRunArgs(tc.args)
+			resource, label, prio, argv := r.resource, r.label, r.priority, r.argv
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("parseRunArgs(%q) = %q/%q/%q/%q, want an error",
