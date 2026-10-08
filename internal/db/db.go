@@ -9,8 +9,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // Path returns the machine-global database path for the current OS user,
@@ -37,7 +39,8 @@ func Path() (string, error) {
 //
 // Non-default choices, all deliberate:
 //   - journal_mode=WAL: readers (status, position checks) never block the
-//     short write transactions used for acquisition.
+//     short write transactions used for acquisition. Set by enableWAL rather
+//     than in the DSN; see there.
 //   - busy_timeout=5000: writers briefly wait out each other's transactions
 //     instead of failing immediately with SQLITE_BUSY.
 //   - synchronous=NORMAL: safe with WAL; this is live coordination state,
@@ -55,18 +58,68 @@ func Open(path string) (*sql.DB, error) {
 	dsn := "file:" + filepath.ToSlash(path) +
 		"?_txlock=immediate" +
 		"&_pragma=busy_timeout(5000)" +
-		"&_pragma=journal_mode(WAL)" +
 		"&_pragma=synchronous(NORMAL)"
 	d, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("opening database: %w", err)
 	}
 	d.SetMaxOpenConns(1)
+	if err := enableWAL(d); err != nil {
+		d.Close()
+		return nil, err
+	}
 	if err := migrate(d); err != nil {
 		d.Close()
 		return nil, err
 	}
 	return d, nil
+}
+
+// walTimeout bounds how long enableWAL keeps retrying, and matches the DSN's
+// busy_timeout: the switch is waited for exactly as long as any other lock.
+// walRetryDelay is short because what it waits out is short - another
+// process's own switch, or its first schema statements.
+const (
+	walTimeout    = 5 * time.Second
+	walRetryDelay = 10 * time.Millisecond
+)
+
+// enableWAL switches the database to WAL mode, waiting out other processes
+// doing the same.
+//
+// It cannot be a DSN pragma like the others. Switching a database into WAL
+// needs an exclusive lock, and SQLite does not call the busy handler for it:
+// while the file is still in rollback mode, the lock other processes hold to
+// create the schema - or to make the same switch - fails the pragma at once
+// with SQLITE_BUSY, busy_timeout notwithstanding. On a brand-new database,
+// several `workgate run`s started together hit that routinely, and the DSN
+// gives no way to retry: the pragma runs while the connection is being made,
+// and its error is the first statement's.
+//
+// The mode is a property of the database file, not of a connection, so this
+// is needed once per Open: a connection the pool makes later opens a file
+// that is already in WAL. Once it is, the pragma takes no lock at all, which
+// keeps the common case a single statement. As before, a file system that
+// cannot do WAL leaves the mode where it was rather than failing the open.
+func enableWAL(d *sql.DB) error {
+	deadline := time.Now().Add(walTimeout)
+	for {
+		var mode string
+		err := d.QueryRow(`PRAGMA journal_mode = WAL`).Scan(&mode)
+		if err == nil {
+			return nil
+		}
+		if !isBusy(err) || time.Now().After(deadline) {
+			return fmt.Errorf("enabling WAL mode: %w", err)
+		}
+		time.Sleep(walRetryDelay)
+	}
+}
+
+// isBusy reports whether err is SQLITE_BUSY, in any of its extended forms.
+func isBusy(err error) bool {
+	var se *sqlite.Error
+	return errors.As(err, &se) && se.Code()&0xff == sqlite3.SQLITE_BUSY
 }
 
 const schema = `

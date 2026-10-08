@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -703,5 +704,80 @@ func TestConcurrentOpenMigratesModesOnce(t *testing.T) {
 	}
 	if mode != "exclusive" {
 		t.Errorf("pre-existing row mode = %q, want exclusive", mode)
+	}
+}
+
+// TestConcurrentOpenOfANewDatabase: several `workgate run`s started together
+// against a database that does not exist yet must all open it, and leave it in
+// WAL mode. Switching to WAL ignores busy_timeout, so set from the DSN this
+// failed with SQLITE_BUSY in most rounds; one round is not enough to show it.
+func TestConcurrentOpenOfANewDatabase(t *testing.T) {
+	for round := 0; round < 20; round++ {
+		path := filepath.Join(t.TempDir(), "workgate.db")
+		const openers = 8
+		errs := make(chan error, openers)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := 0; i < openers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				d, err := Open(path)
+				if err != nil {
+					errs <- err
+					return
+				}
+				d.Close()
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatalf("round %d: concurrent open of a new database: %v", round, err)
+		}
+
+		d, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var mode string
+		err = d.QueryRow(`PRAGMA journal_mode`).Scan(&mode)
+		d.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mode != "wal" {
+			t.Fatalf("round %d: journal_mode = %q, want wal", round, mode)
+		}
+	}
+}
+
+func TestIsBusy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "workgate.db")
+	holder, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	tx, err := holder.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	// No busy_timeout: the second writer fails at once, with the real error.
+	other, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?_txlock=immediate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	_, err = other.Begin()
+	if !isBusy(err) {
+		t.Errorf("isBusy(%v) = false for a writer locked out by another", err)
+	}
+	if isBusy(errors.New("database is locked")) || isBusy(nil) {
+		t.Error("isBusy matched something that is not an SQLite error")
 	}
 }
